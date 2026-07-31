@@ -1,0 +1,1530 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Provident — Lead Intake API",
+    "version": "1.0.0",
+    "description": "Server-to-server API for pushing leads into the Provident CRM.\n\nCore endpoints:\n1. `POST /oauth2/token` — exchange client credentials for a bearer token.\n2. `POST /public/leads` — create a CRM lead.\n\nOptional read-only reference data, using the same token: locations, developers, projects and project statuses. Use them to send values that match ours, or to show project content on your own pages. They share the lead endpoint's rate limit, so cache them.\n\nAuthentication is OAuth 2.0 Client Credentials; there is no user login. Note that the `/v2` prefix is part of the server URL and is mandatory.\n\nThe intake is deliberately forgiving: name-based lookup fields that cannot be matched do NOT fail the request — the lead is still created and the unmatched values are returned in `intakeUnresolved`.\n\nThe endpoint is NOT idempotent: posting the same payload twice creates two leads. Retry only on network timeouts, 429 and 5xx.",
+    "contact": {
+      "name": "Provident API support"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://devapi.prov.ae/v2",
+      "description": "Staging / development — build and test here"
+    },
+    {
+      "url": "https://prodapi.prov.ae/v2",
+      "description": "Production — live leads"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Authentication",
+      "description": "OAuth 2.0 client-credentials token issuance"
+    },
+    {
+      "name": "Lead intake",
+      "description": "Public lead creation"
+    },
+    {
+      "name": "Reference data",
+      "description": "Read-only lookups — locations, developers, projects, project statuses"
+    }
+  ],
+  "paths": {
+    "/oauth2/token": {
+      "post": {
+        "tags": ["Authentication"],
+        "operationId": "getAccessToken",
+        "summary": "Get an access token (client credentials)",
+        "description": "Exchanges your `client_id` and `client_secret` for a short-lived opaque bearer token. `client_credentials` is the only supported grant type.\n\nCache the token in memory for `expires_in` seconds (refresh ~60 seconds early) — token requests count against your rate limit.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/TokenRequest" },
+              "example": {
+                "grant_type": "client_credentials",
+                "client_id": "YOUR_CLIENT_ID",
+                "client_secret": "YOUR_CLIENT_SECRET"
+              }
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": { "$ref": "#/components/schemas/TokenRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Token issued",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TokenResponse" },
+                "example": {
+                  "access_token": "9f2c1b7d4e8a3c5f6b0d2e4a8c1f3b5d7e9a0c2f4b6d8e0a2c4f6b8d0e2a4c6f",
+                  "token_type": "Bearer",
+                  "expires_in": 3600,
+                  "scope": ""
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid client credentials, unknown client, or unsupported grant type",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApiError" },
+                "example": {
+                  "statusCode": 401,
+                  "code": "UNAUTHORIZED",
+                  "message": "Invalid client credentials",
+                  "path": "/v2/oauth2/token",
+                  "timestamp": "2026-07-27T06:28:41.703Z"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/public/leads": {
+      "post": {
+        "tags": ["Lead intake"],
+        "operationId": "createPublicLead",
+        "summary": "Create a CRM lead",
+        "description": "Creates a lead in the Provident CRM and attaches it to a contact.\n\n**Only hard requirement:** at least one entry in `leadPhones` or `leadEmails`.\n\n**Contact resolution** — an existing contact is matched by phone first, then by email; if nothing matches, a new contact is created from the supplied name/company/phone/email fields. Send phone numbers in E.164 (`+971501234567`) for reliable matching.\n\n**Lookup fields** (`leadType`, `source`, `subSource`, `eventType`, `marketingType`, `campaignName`, `advertisingCampaign`, `website`, `currency`, `localeCountry`, `areaOfInterest`, `propertyTypeInterest`, `marketSegment`, `agentCategory`, `languages`, `assignedBy`, `listingId`/`referenceNo`) are matched case-insensitively after trimming against lists configured in the CRM. An unmatched value never fails the request — the lead is created and the original text is returned in `intakeUnresolved`.\n\n**Extra fields** not defined in this schema are accepted and stored verbatim with the lead rather than rejected.\n\n**Not idempotent:** the same payload posted twice creates two leads.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateLeadRequest" },
+              "examples": {
+                "minimal": {
+                  "summary": "Minimum valid request",
+                  "value": {
+                    "leadPhones": ["+971501234567"],
+                    "leadFirstName": "John",
+                    "leadLastName": "Doe"
+                  }
+                },
+                "websiteForm": {
+                  "summary": "Typical website / paid-search form submission",
+                  "value": {
+                    "leadPhones": ["+971501234567"],
+                    "leadEmails": ["john.doe@example.com"],
+                    "leadFirstName": "John",
+                    "leadLastName": "Doe",
+                    "leadType": "Primary",
+                    "source": "Website",
+                    "subSource": ["Callback Form"],
+                    "eventType": "Submit Form",
+                    "marketingType": "Paid",
+                    "website": "provident.ae",
+                    "campaignName": "Spring 2026 Landing Page",
+                    "developerName": "Sobha Realty",
+                    "formName": "contact-popup-form",
+                    "areaOfInterest": "Dubai Marina",
+                    "propertyTypeInterest": "Apartment",
+                    "budgetMin": "1000000",
+                    "budgetMax": "2500000",
+                    "currency": "AED",
+                    "initialInquiry": "Looking for a 2BR with sea view, ready Q4.",
+                    "languages": ["English", "ar"],
+                    "localeCountry": "AE",
+                    "pageUrl": "https://prov.ae/en/dubai-marina",
+                    "pathLocale": "en",
+                    "gclid": "Cj0KCQ...",
+                    "utmSource": "google",
+                    "utmMedium": "cpc",
+                    "utmCampaign": "spring-2026",
+                    "utmTerm": "dubai marina apartments",
+                    "utmContent": "hero-cta"
+                  }
+                },
+                "allFields": {
+                  "summary": "Every supported field — send as much of this as you have",
+                  "description": "The complete surface of the endpoint. Nothing is required except one phone or email; omit fields you do not have rather than sending empty strings or nulls.",
+                  "value": {
+                    "leadPhones": ["+971501234567", "+971559876543"],
+                    "leadEmails": ["john.doe@example.com", "j.doe@work.example.com"],
+                    "leadFirstName": "John",
+                    "leadMiddleName": "Ahmad",
+                    "leadSecondName": "A.",
+                    "leadLastName": "Doe",
+                    "leadCompanyName": "Acme Real Estate",
+                    "leadType": "Primary",
+                    "priority": "High",
+                    "marketSegment": "Luxury",
+                    "agentCategory": "A",
+                    "areaOfInterest": "Dubai Marina",
+                    "propertyTypeInterest": "Apartment",
+                    "budgetMin": "1000000",
+                    "budgetMax": "2500000",
+                    "currency": "AED",
+                    "initialInquiry": "Looking for a 2BR with sea view, ready to move in Q4.",
+                    "languages": ["English", "ar"],
+                    "listingId": "8f3c1e2a-1122-3344-5566-778899aabbcc",
+                    "referenceNo": "PR-123456",
+                    "source": "Website",
+                    "subSource": ["Callback Form", "Team Page"],
+                    "marketingType": "Paid",
+                    "eventType": "Submit Form",
+                    "campaignName": "Spring 2026 Landing Page",
+                    "advertisingCampaign": "Google Ads — Q3",
+                    "developerName": "Sobha Realty",
+                    "website": "provident.ae",
+                    "pageUrl": "https://prov.ae/en/dubai-marina?utm_source=google&utm_medium=cpc",
+                    "pathLocale": "en",
+                    "gclid": "Cj0KCQjw1234567890",
+                    "fbclid": "IwAR2abcdefghijklmno",
+                    "utmSource": "google",
+                    "utmMedium": "cpc",
+                    "utmCampaign": "spring-2026",
+                    "utmTerm": "dubai marina apartments",
+                    "utmContent": "hero-cta",
+                    "formName": "contact-popup-form",
+                    "adsetName": "test ww",
+                    "referrer": "https://sobha-city.provident.ae/?utm_source=Google+Ads",
+                    "ipAddress": "217.165.113.16",
+                    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                    "submittedAt": "2026-07-27T13:45:31.728Z",
+                    "localeCountry": "AE",
+                    "assignedBy": "agent@providentestate.com",
+                    "metaFacebook": {
+                      "metaLeadId": "7636865386872307975",
+                      "metaCreatedAt": "2026-05-06T19:38:09.000Z",
+                      "platform": "facebook",
+                      "adId": "120000000000",
+                      "adName": "Marina Launch — Video",
+                      "adType": "Video",
+                      "adgroupId": "930000000000",
+                      "adgroupName": "TARGETED",
+                      "metaCampaignId": "230000000000",
+                      "metaCampaignName": "Marina Q2",
+                      "formId": "550000000000",
+                      "formName": "Marina Callback",
+                      "adAccountId": "act_123456789",
+                      "businessAccountId": "456789123",
+                      "sourceAction": "Form",
+                      "finalPageName": "Thank You",
+                      "customFields": {
+                        "هل ترغب في حضور هذا المعرض الحصري؟": "نعم",
+                        "Preferred call time": "Evening",
+                        "Ready to buy": "Within 3 months"
+                      }
+                    }
+                  }
+                },
+                "metaLeadAd": {
+                  "summary": "Meta / Facebook lead-ad submission",
+                  "value": {
+                    "leadPhones": ["+971559876543"],
+                    "leadEmails": ["sara@example.com"],
+                    "leadFirstName": "Sara",
+                    "leadLastName": "Ahmad",
+                    "leadType": "Primary",
+                    "source": "Facebook",
+                    "eventType": "Submit Form",
+                    "marketingType": "Paid",
+                    "campaignName": "Marina Q2",
+                    "marketSegment": "Luxury",
+                    "agentCategory": "A",
+                    "languages": ["ar"],
+                    "metaFacebook": {
+                      "metaLeadId": "7636865386872307975",
+                      "metaCreatedAt": "2026-05-06T19:38:09.000Z",
+                      "platform": "facebook",
+                      "adId": "120000000000",
+                      "adName": "Marina Launch — Video",
+                      "adType": "Video",
+                      "adgroupId": "930000000000",
+                      "adgroupName": "TARGETED",
+                      "metaCampaignId": "230000000000",
+                      "metaCampaignName": "Marina Q2",
+                      "formId": "550000000000",
+                      "formName": "Marina Callback",
+                      "adAccountId": "act_123456789",
+                      "businessAccountId": "456789123",
+                      "sourceAction": "Form",
+                      "finalPageName": "Thank You",
+                      "customFields": {
+                        "هل ترغب في حضور هذا المعرض الحصري؟": "نعم",
+                        "Preferred call time": "Evening"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Lead created. Further fields may be present in the body; they are not part of this contract — read only the documented ones.",
+            "headers": {
+              "X-RateLimit-Limit": { "$ref": "#/components/headers/XRateLimitLimit" },
+              "X-RateLimit-Remaining": { "$ref": "#/components/headers/XRateLimitRemaining" },
+              "X-RateLimit-Reset": { "$ref": "#/components/headers/XRateLimitReset" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CreatedLead" },
+                "example": {
+                  "id": "a1b2c3d4-5566-7788-99aa-bbccddeeff00",
+                  "contactId": "0f1e2d3c-4455-6677-8899-aabbccddeeff",
+                  "intakeUnresolved": { "advertisingCampaign": "Google Ads — Q3" },
+                  "needsIntakeReview": true,
+                  "createdAt": "2026-07-27T06:31:04.512Z"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Neither a phone nor an email was supplied, or the body was not valid JSON. Do not retry unchanged.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApiError" },
+                "examples": {
+                  "noContactPoint": {
+                    "summary": "No phone and no email",
+                    "value": {
+                      "statusCode": 400,
+                      "code": "BAD_REQUEST",
+                      "message": "Provide at least one value in leadPhones or leadEmails",
+                      "path": "/v2/public/leads",
+                      "timestamp": "2026-07-27T06:31:04.512Z"
+                    }
+                  },
+                  "invalidJson": {
+                    "summary": "Malformed JSON body",
+                    "value": {
+                      "statusCode": 400,
+                      "code": "INVALID_JSON",
+                      "message": "Invalid JSON payload",
+                      "path": "/v2/public/leads",
+                      "timestamp": "2026-07-27T06:31:04.512Z"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, revoked or expired bearer token. Fetch a new token and retry once.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApiError" },
+                "examples": {
+                  "missing": {
+                    "summary": "No Authorization header",
+                    "value": {
+                      "statusCode": 401,
+                      "code": "OAUTH_TOKEN_MISSING",
+                      "message": "OAuth token missing",
+                      "path": "/v2/public/leads",
+                      "timestamp": "2026-07-27T06:28:41.816Z"
+                    }
+                  },
+                  "expired": {
+                    "summary": "Token past expiry",
+                    "value": {
+                      "statusCode": 401,
+                      "code": "OAUTH_TOKEN_EXPIRED",
+                      "message": "OAuth access token expired",
+                      "path": "/v2/public/leads",
+                      "timestamp": "2026-07-27T06:28:41.816Z"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller's IP address is not on the allowlist configured for this client.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApiError" },
+                "example": {
+                  "statusCode": 403,
+                  "code": "FORBIDDEN",
+                  "message": "Access denied. Your IP address (203.0.113.10) is not permitted.",
+                  "path": "/v2/public/leads",
+                  "timestamp": "2026-07-27T06:31:04.512Z"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "description": "Server-side failure. Retry with exponential backoff.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApiError" },
+                "example": {
+                  "statusCode": 500,
+                  "code": "INTERNAL_ERROR",
+                  "message": "Internal server error",
+                  "path": "/v2/public/leads",
+                  "timestamp": "2026-07-27T06:31:04.512Z"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/public/projects/filters": {
+      "get": {
+        "tags": ["Reference data"],
+        "operationId": "getProjectFilters",
+        "summary": "Locations, developers, property types and statuses",
+        "description": "Returns every lookup list in one call. There is no standalone locations endpoint — this is where locations come from.\n\nUse `filters.location.values[].name` as the lead's `areaOfInterest` and `filters.propertyType.values[].name` as `propertyTypeInterest` so those values resolve instead of landing in `intakeUnresolved`. The UUIDs are the ones accepted by the project list filters.\n\nThese lists change rarely — cache them (a daily refresh is plenty) rather than calling per lead, since reference reads share the lead endpoint's rate limit.",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Filter lists",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ProjectFiltersResponse" },
+                "example": {
+                  "filters": {
+                    "developer": {
+                      "displayName": "Developer",
+                      "values": [{ "id": "11111111-1111-1111-1111-111111111111", "name": "Emaar" }]
+                    },
+                    "location": {
+                      "displayName": "Location",
+                      "values": [
+                        {
+                          "id": "22222222-2222-2222-2222-222222222222",
+                          "name": "Dubai Marina",
+                          "fullName": "Dubai"
+                        }
+                      ]
+                    },
+                    "propertyType": {
+                      "displayName": "Property Type",
+                      "values": [{ "id": "33333333-3333-3333-3333-333333333333", "name": "Apartment" }]
+                    },
+                    "status": {
+                      "displayName": "Status",
+                      "values": [
+                        {
+                          "id": "44444444-4444-4444-4444-444444444444",
+                          "name": "Off-plan",
+                          "color": "#00aaaa"
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/public/developers": {
+      "get": {
+        "tags": ["Reference data"],
+        "operationId": "listDevelopers",
+        "summary": "List developers",
+        "description": "Paginated list of enabled developers.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "$ref": "#/components/parameters/Page" },
+          { "$ref": "#/components/parameters/Limit" },
+          { "$ref": "#/components/parameters/Popular" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated developers",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/DeveloperListResponse" },
+                "example": {
+                  "data": [
+                    {
+                      "id": "11111111-1111-1111-1111-111111111111",
+                      "name": "Emaar",
+                      "slug": "emaar",
+                      "logoUrl": "https://media.prov.ae/public/developers/emaar-logo.png",
+                      "imageUrl": "https://media.prov.ae/public/developers/emaar-cover.jpg",
+                      "description": "Master developer.",
+                      "popular": true
+                    }
+                  ],
+                  "meta": { "page": 1, "limit": 50, "total": 120, "totalPages": 3 }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/public/developers/search": {
+      "get": {
+        "tags": ["Reference data"],
+        "operationId": "searchDevelopers",
+        "summary": "Search developers",
+        "description": "Matches the term against developer name, slug and description, ranking exact-name matches first. Falls back to the plain list when no term is given.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "description": "Search term. Aliases: `search`, `query`.",
+            "schema": { "type": "string" },
+            "example": "emaar"
+          },
+          { "$ref": "#/components/parameters/Page" },
+          { "$ref": "#/components/parameters/Limit" },
+          { "$ref": "#/components/parameters/Popular" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated developers, most relevant first",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/DeveloperListResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/public/developers/{id}": {
+      "get": {
+        "tags": ["Reference data"],
+        "operationId": "getDeveloper",
+        "summary": "Get one developer",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Developer UUID.",
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Developer",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Developer" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": {
+            "description": "Not found, or the developer is disabled",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } }
+            }
+          },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/public/projects": {
+      "get": {
+        "tags": ["Reference data"],
+        "operationId": "listProjects",
+        "summary": "List published projects",
+        "description": "Paginated, filterable list of published projects. Returns the compact shape by default; pass `simplified=false` for the full record.\n\nThe UUIDs accepted by `developerIds`, `locationIds`, `statusIds` and `propertyTypes` all come from `GET /public/projects/filters`.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "description": "Free-text search.",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "developerIds",
+            "in": "query",
+            "required": false,
+            "description": "Comma-separated developer UUIDs. Alias: `developerId`.",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "locationIds",
+            "in": "query",
+            "required": false,
+            "description": "Comma-separated location UUIDs. Alias: `locationId`.",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "statusIds",
+            "in": "query",
+            "required": false,
+            "description": "Comma-separated status UUIDs. Alias: `statusId`.",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "propertyTypes",
+            "in": "query",
+            "required": false,
+            "description": "Comma-separated property-type UUIDs. Alias: `propertyType`.",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "minPrice",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "maxPrice",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "deliveryFrom",
+            "in": "query",
+            "required": false,
+            "description": "Handover date lower bound.",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "deliveryTo",
+            "in": "query",
+            "required": false,
+            "description": "Handover date upper bound.",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "ownershipType",
+            "in": "query",
+            "required": false,
+            "description": "Value from the filters call.",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "campaignType",
+            "in": "query",
+            "required": false,
+            "description": "Value from the filters call.",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "stockAvailability",
+            "in": "query",
+            "required": false,
+            "description": "Value from the filters call.",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "simplified",
+            "in": "query",
+            "required": false,
+            "description": "`true` (default) returns the compact project shape; `false` returns the full record.",
+            "schema": { "type": "boolean", "default": true }
+          },
+          { "$ref": "#/components/parameters/Page" },
+          { "$ref": "#/components/parameters/Limit" },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer" }
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "order",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string", "enum": ["asc", "desc"] }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated projects",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ProjectListResponse" },
+                "example": {
+                  "data": [
+                    {
+                      "id": "55555555-5555-5555-5555-555555555555",
+                      "title": "Marina Heights",
+                      "slug": "marina-heights",
+                      "campaignType": "Launch",
+                      "propertyTypes": ["Apartment", "Penthouse"],
+                      "startingPrice": "1200000",
+                      "deliveryDate": "2027-06-30T00:00:00.000Z",
+                      "brochure": true,
+                      "paymentPlans": ["60/40"],
+                      "developer": { "name": "Emaar" },
+                      "location": {
+                        "id": "22222222-2222-2222-2222-222222222222",
+                        "name": "Dubai Marina",
+                        "fullPath": "Dubai | Dubai Marina",
+                        "parentName": "Dubai"
+                      },
+                      "image": {
+                        "url": "https://media.prov.ae/public/projects/images/marina-heights.jpg",
+                        "sortOrder": 0
+                      },
+                      "status": {
+                        "id": "44444444-4444-4444-4444-444444444444",
+                        "name": "Off-plan"
+                      }
+                    }
+                  ],
+                  "meta": { "page": 1, "limit": 20, "total": 84, "totalPages": 5 }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/public/projects/map": {
+      "get": {
+        "tags": ["Reference data"],
+        "operationId": "listProjectsOnMap",
+        "summary": "Published projects inside a bounding box",
+        "description": "Map pins for published projects within the given viewport. Accepts the same filter parameters as the project list. Returns `{ \"data\": [] }` when any bound is not a finite number.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "latMin",
+            "in": "query",
+            "required": true,
+            "description": "South-west corner latitude.",
+            "schema": { "type": "number" }
+          },
+          {
+            "name": "latMax",
+            "in": "query",
+            "required": true,
+            "description": "North-east corner latitude.",
+            "schema": { "type": "number" }
+          },
+          {
+            "name": "lngMin",
+            "in": "query",
+            "required": true,
+            "description": "South-west corner longitude.",
+            "schema": { "type": "number" }
+          },
+          {
+            "name": "lngMax",
+            "in": "query",
+            "required": true,
+            "description": "North-east corner longitude.",
+            "schema": { "type": "number" }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "developerIds",
+            "in": "query",
+            "required": false,
+            "description": "Comma-separated developer UUIDs.",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "locationIds",
+            "in": "query",
+            "required": false,
+            "description": "Comma-separated location UUIDs.",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "statusIds",
+            "in": "query",
+            "required": false,
+            "description": "Comma-separated status UUIDs.",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "propertyTypes",
+            "in": "query",
+            "required": false,
+            "description": "Comma-separated property-type UUIDs.",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Map pins",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": { "type": "object", "additionalProperties": true }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/public/projects/{id}": {
+      "get": {
+        "tags": ["Reference data"],
+        "operationId": "getProject",
+        "summary": "Get one published project",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Project UUID.",
+            "schema": { "type": "string", "format": "uuid" }
+          },
+          {
+            "name": "simplified",
+            "in": "query",
+            "required": false,
+            "description": "`true` (default) returns the compact shape; `false` returns the full record.",
+            "schema": { "type": "boolean", "default": true }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Project",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ProjectSimplified" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": {
+            "description": "Not found, or the project is not published",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } }
+            }
+          },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/public/project-statuses": {
+      "get": {
+        "tags": ["Reference data"],
+        "operationId": "listProjectStatuses",
+        "summary": "List project statuses",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Project statuses",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/ProjectStatus" }
+                },
+                "example": [
+                  {
+                    "id": "44444444-4444-4444-4444-444444444444",
+                    "name": "Off-plan",
+                    "color": "#00aaaa"
+                  }
+                ]
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "Opaque",
+        "description": "The `access_token` returned by `POST /oauth2/token`, sent as `Authorization: Bearer <access_token>`. It is an opaque string, not a JWT."
+      }
+    },
+    "headers": {
+      "XRateLimitLimit": {
+        "description": "Requests allowed in the current window.",
+        "schema": { "type": "integer" }
+      },
+      "XRateLimitRemaining": {
+        "description": "Requests remaining in the current window.",
+        "schema": { "type": "integer" }
+      },
+      "XRateLimitReset": {
+        "description": "Seconds until the counter resets (end of the UTC day).",
+        "schema": { "type": "integer" }
+      }
+    },
+    "parameters": {
+      "Page": {
+        "name": "page",
+        "in": "query",
+        "required": false,
+        "description": "1-indexed page number.",
+        "schema": { "type": "integer", "minimum": 1, "default": 1 }
+      },
+      "Limit": {
+        "name": "limit",
+        "in": "query",
+        "required": false,
+        "description": "Page size.",
+        "schema": { "type": "integer", "minimum": 1 }
+      },
+      "Popular": {
+        "name": "popular",
+        "in": "query",
+        "required": false,
+        "description": "Omit for all enabled developers; `true` / `false` filters by the popular flag.",
+        "schema": { "type": "string", "enum": ["true", "false"] }
+      }
+    },
+    "responses": {
+      "Unauthorized": {
+        "description": "Missing, invalid, revoked or expired bearer token.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ApiError" },
+            "example": {
+              "statusCode": 401,
+              "code": "OAUTH_TOKEN_EXPIRED",
+              "message": "OAuth access token expired",
+              "path": "/v2/public/projects/filters",
+              "timestamp": "2026-07-27T06:31:04.512Z"
+            }
+          }
+        }
+      },
+      "RateLimited": {
+        "description": "Request quota for this client exceeded. Wait `Retry-After` seconds, then resume.",
+        "headers": {
+          "Retry-After": {
+            "description": "Seconds to wait before retrying.",
+            "schema": { "type": "integer" }
+          },
+          "X-RateLimit-Limit": { "$ref": "#/components/headers/XRateLimitLimit" },
+          "X-RateLimit-Remaining": { "$ref": "#/components/headers/XRateLimitRemaining" },
+          "X-RateLimit-Reset": { "$ref": "#/components/headers/XRateLimitReset" }
+        },
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ApiError" },
+            "example": {
+              "statusCode": 429,
+              "code": "RATE_LIMITED",
+              "message": "Too Many Requests",
+              "path": "/v2/public/leads",
+              "timestamp": "2026-07-27T06:31:04.512Z"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "TokenRequest": {
+        "type": "object",
+        "required": ["grant_type", "client_id", "client_secret"],
+        "properties": {
+          "grant_type": {
+            "type": "string",
+            "enum": ["client_credentials"],
+            "description": "The only supported grant type."
+          },
+          "client_id": {
+            "type": "string",
+            "description": "Client id issued by Provident (per environment)."
+          },
+          "client_secret": {
+            "type": "string",
+            "description": "Client secret issued by Provident. Server-side use only — never expose it in a browser or mobile app."
+          }
+        }
+      },
+      "TokenResponse": {
+        "type": "object",
+        "properties": {
+          "access_token": {
+            "type": "string",
+            "description": "Opaque bearer token. Send as `Authorization: Bearer <access_token>`."
+          },
+          "token_type": { "type": "string", "example": "Bearer" },
+          "expires_in": {
+            "type": "integer",
+            "description": "Seconds until the token expires (typically 3600).",
+            "example": 3600
+          },
+          "scope": {
+            "type": "string",
+            "description": "Space-separated scopes granted to the client. May be empty."
+          }
+        }
+      },
+      "ApiError": {
+        "type": "object",
+        "description": "Common error envelope used by every endpoint.",
+        "properties": {
+          "statusCode": { "type": "integer", "example": 400 },
+          "code": {
+            "type": "string",
+            "description": "Stable machine-readable error code — branch on this, not on `message`.",
+            "example": "BAD_REQUEST"
+          },
+          "message": { "type": "string", "description": "Human-readable description." },
+          "errors": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Present only for multi-error validation failures."
+          },
+          "details": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Optional structured extras attached by the failing handler."
+          },
+          "path": { "type": "string", "example": "/v2/public/leads" },
+          "timestamp": { "type": "string", "format": "date-time" }
+        }
+      },
+      "PaginationMeta": {
+        "type": "object",
+        "properties": {
+          "page": { "type": "integer", "example": 1 },
+          "limit": { "type": "integer", "example": 50 },
+          "total": { "type": "integer", "example": 120 },
+          "totalPages": { "type": "integer", "example": 3 }
+        }
+      },
+      "FilterValue": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "name": { "type": "string", "nullable": true }
+        },
+        "additionalProperties": true
+      },
+      "LocationFilterValue": {
+        "type": "object",
+        "description": "A location. Send `name` as the lead's `areaOfInterest`; `id` is what the project filters accept.",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "name": { "type": "string", "nullable": true, "example": "Dubai Marina" },
+          "fullName": {
+            "type": "string",
+            "nullable": true,
+            "description": "Parent location — use it to tell similarly named areas apart.",
+            "example": "Dubai"
+          }
+        }
+      },
+      "FilterGroup": {
+        "type": "object",
+        "properties": {
+          "displayName": { "type": "string" },
+          "values": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/FilterValue" }
+          }
+        }
+      },
+      "ProjectFiltersResponse": {
+        "type": "object",
+        "properties": {
+          "filters": {
+            "type": "object",
+            "properties": {
+              "developer": { "$ref": "#/components/schemas/FilterGroup" },
+              "location": {
+                "type": "object",
+                "properties": {
+                  "displayName": { "type": "string" },
+                  "values": {
+                    "type": "array",
+                    "items": { "$ref": "#/components/schemas/LocationFilterValue" }
+                  }
+                }
+              },
+              "propertyType": {
+                "allOf": [{ "$ref": "#/components/schemas/FilterGroup" }],
+                "description": "Send a value's `name` as the lead's `propertyTypeInterest`."
+              },
+              "status": {
+                "type": "object",
+                "properties": {
+                  "displayName": { "type": "string" },
+                  "values": {
+                    "type": "array",
+                    "items": { "$ref": "#/components/schemas/ProjectStatus" }
+                  }
+                }
+              },
+              "campaignType": { "$ref": "#/components/schemas/FilterGroup" },
+              "ownershipType": { "$ref": "#/components/schemas/FilterGroup" },
+              "stockAvailability": { "$ref": "#/components/schemas/FilterGroup" }
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "ProjectStatus": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "name": { "type": "string", "nullable": true, "example": "Off-plan" },
+          "color": { "type": "string", "nullable": true, "example": "#00aaaa" }
+        },
+        "additionalProperties": true
+      },
+      "Developer": {
+        "type": "object",
+        "description": "An enabled developer. Additional fields may be present; only these are contractual.",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "name": { "type": "string", "example": "Emaar" },
+          "slug": { "type": "string", "example": "emaar" },
+          "logoUrl": { "type": "string", "nullable": true },
+          "imageUrl": { "type": "string", "nullable": true },
+          "description": { "type": "string", "nullable": true },
+          "popular": { "type": "boolean" }
+        },
+        "additionalProperties": true
+      },
+      "DeveloperListResponse": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Developer" }
+          },
+          "meta": { "$ref": "#/components/schemas/PaginationMeta" }
+        }
+      },
+      "ProjectLocation": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "name": { "type": "string", "nullable": true, "example": "Dubai Marina" },
+          "fullPath": { "type": "string", "nullable": true, "example": "Dubai | Dubai Marina" },
+          "parentId": { "type": "string", "format": "uuid", "nullable": true },
+          "parentName": { "type": "string", "nullable": true, "example": "Dubai" },
+          "level": { "type": "string", "nullable": true }
+        },
+        "additionalProperties": true
+      },
+      "ProjectImage": {
+        "type": "object",
+        "properties": {
+          "url": { "type": "string", "nullable": true },
+          "originalFileName": { "type": "string" },
+          "mimeType": { "type": "string", "nullable": true },
+          "sortOrder": { "type": "integer", "nullable": true }
+        },
+        "additionalProperties": true
+      },
+      "ProjectSimplified": {
+        "type": "object",
+        "description": "Compact project shape (the default). Additional fields may be present; only these are contractual.",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "title": { "type": "string", "nullable": true, "example": "Marina Heights" },
+          "slug": { "type": "string", "nullable": true },
+          "campaignType": { "type": "string", "nullable": true },
+          "propertyTypes": { "type": "array", "items": { "type": "string" } },
+          "startingPrice": { "type": "string", "nullable": true },
+          "deliveryDate": { "type": "string", "format": "date-time", "nullable": true },
+          "brochure": { "type": "boolean" },
+          "paymentPlans": { "type": "array", "items": { "type": "string" } },
+          "developer": {
+            "type": "object",
+            "nullable": true,
+            "properties": { "name": { "type": "string", "nullable": true } }
+          },
+          "location": { "$ref": "#/components/schemas/ProjectLocation" },
+          "image": { "$ref": "#/components/schemas/ProjectImage" },
+          "status": { "$ref": "#/components/schemas/ProjectStatus" }
+        },
+        "additionalProperties": true
+      },
+      "ProjectListResponse": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/ProjectSimplified" }
+          },
+          "meta": { "$ref": "#/components/schemas/PaginationMeta" }
+        }
+      },
+      "CreatedLead": {
+        "type": "object",
+        "description": "The created lead. Additional fields may be present in the response; only the properties listed here are contractual and safe to depend on.",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "UUID of the created lead. Store this against your own submission record."
+          },
+          "contactId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "UUID of the contact the lead was attached to (matched or newly created)."
+          },
+          "intakeUnresolved": {
+            "type": "object",
+            "nullable": true,
+            "additionalProperties": { "type": "string" },
+            "description": "Map of field name → the original value you sent, for every lookup value that could not be matched. `null` when everything resolved.",
+            "example": { "source": "Web-Site" }
+          },
+          "needsIntakeReview": {
+            "type": "boolean",
+            "description": "`true` when `intakeUnresolved` is non-empty."
+          },
+          "createdAt": { "type": "string", "format": "date-time" }
+        },
+        "additionalProperties": true
+      },
+      "CreateLeadRequest": {
+        "type": "object",
+        "description": "Lead intake payload. At least one entry in `leadPhones` or `leadEmails` is required; every other field is optional. Unknown fields are accepted and stored verbatim with the lead.",
+        "properties": {
+          "leadPhones": {
+            "type": "array",
+            "items": { "type": "string", "maxLength": 64 },
+            "description": "Phone numbers. Used FIRST to match an existing contact. Use E.164 format for reliable matching. Required unless `leadEmails` is supplied.",
+            "example": ["+971501234567"]
+          },
+          "leadEmails": {
+            "type": "array",
+            "items": { "type": "string", "maxLength": 255 },
+            "description": "Email addresses. Used to match an existing contact when no phone matches. Required unless `leadPhones` is supplied.",
+            "example": ["john.doe@example.com"]
+          },
+          "leadFirstName": { "type": "string", "maxLength": 255, "nullable": true, "example": "John" },
+          "leadMiddleName": { "type": "string", "maxLength": 255, "nullable": true, "example": "Ahmad" },
+          "leadSecondName": {
+            "type": "string",
+            "maxLength": 255,
+            "nullable": true,
+            "description": "Second given name — used when no middle name is supplied.",
+            "example": "A."
+          },
+          "leadLastName": { "type": "string", "maxLength": 255, "nullable": true, "example": "Doe" },
+          "leadCompanyName": {
+            "type": "string",
+            "maxLength": 255,
+            "nullable": true,
+            "description": "Company name for corporate enquiries.",
+            "example": "Acme Real Estate"
+          },
+
+          "leadType": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Lead type display name, e.g. `Primary`, `Secondary`, `Primary and Secondary`, `Broker`, `Seller`, `Tenant`, `Landlord`. The legacy wording `Primary Buyer`, `Secondary Buyer` and `Primary Buyer and Secondary` is accepted and mapped onto the first three. Ask Provident for the full list.",
+            "example": "Primary"
+          },
+          "priority": {
+            "type": "string",
+            "maxLength": 64,
+            "nullable": true,
+            "description": "Free text priority indicator.",
+            "example": "High"
+          },
+          "marketSegment": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Marketing's segmentation of the lead.",
+            "enum": ["Standard", "Luxury", "Super Luxury"],
+            "example": "Luxury"
+          },
+          "agentCategory": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Marketing's grading of the lead.",
+            "enum": ["A", "B", "C", "D"],
+            "example": "A"
+          },
+
+          "areaOfInterest": {
+            "type": "string",
+            "nullable": true,
+            "description": "LOOKUP. Location the lead is interested in.",
+            "example": "Dubai Marina"
+          },
+          "propertyTypeInterest": {
+            "type": "string",
+            "maxLength": 255,
+            "nullable": true,
+            "description": "LOOKUP. Property type the lead is interested in.",
+            "example": "Apartment"
+          },
+          "budgetMin": {
+            "type": "string",
+            "nullable": true,
+            "description": "Minimum budget. Numeric string; a JSON number is also accepted.",
+            "example": "1000000"
+          },
+          "budgetMax": {
+            "type": "string",
+            "nullable": true,
+            "description": "Maximum budget. Numeric string; a JSON number is also accepted.",
+            "example": "2500000"
+          },
+          "currency": {
+            "type": "string",
+            "maxLength": 3,
+            "description": "LOOKUP. ISO 4217 currency code for the budget values.",
+            "example": "AED"
+          },
+          "initialInquiry": {
+            "type": "string",
+            "nullable": true,
+            "description": "Free-text message or callback reason from the form.",
+            "example": "Looking for a 2BR with sea view, ready to move in Q4."
+          },
+          "languages": {
+            "type": "array",
+            "items": { "type": "string", "maxLength": 255 },
+            "description": "LOOKUP. Languages the lead speaks, by code or name. Unrecognised entries are ignored.",
+            "example": ["ar", "English"]
+          },
+
+          "listingId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "LOOKUP. Provident listing UUID. Takes precedence over `referenceNo` when both are sent."
+          },
+          "referenceNo": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "LOOKUP. Listing reference number, used when `listingId` is not supplied.",
+            "example": "PR-123456"
+          },
+
+          "source": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Lead source. Send this — an unrecognised or omitted source leaves the lead with no source attribution.",
+            "example": "Website"
+          },
+          "subSource": {
+            "type": "array",
+            "items": { "type": "string", "maxLength": 255 },
+            "description": "LOOKUP. Sub-sources. Only those linked to the resolved `source` are kept; ignored entirely when `source` did not resolve.",
+            "example": ["Callback Form", "Team Page"]
+          },
+          "marketingType": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Marketing type, e.g. Organic or Paid.",
+            "example": "Organic"
+          },
+          "eventType": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. What the user did — e.g. Submit Form, Call, Whatsapp Click, DM, Webpush, Gamification.",
+            "example": "Submit Form"
+          },
+          "campaignName": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. CRM campaign name.",
+            "example": "Spring 2026 Landing Page"
+          },
+          "advertisingCampaign": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Advertising campaign name.",
+            "example": "Google Ads — Q3"
+          },
+          "developerName": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Developer the enquiry is about, matched on name or slug — `Sobha Realty` or `sobha-realty`. Values come from `GET /public/developers`.",
+            "example": "Sobha Realty"
+          },
+          "developerId": {
+            "type": "string",
+            "description": "Developer uuid from `GET /public/developers`. Takes precedence over `developerName`; a non-uuid value here is treated as a name instead of being discarded.",
+            "example": "8ecf4fcd-ec63-5764-8524-7cd917494dbe"
+          },
+          "website": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Website NAME or DOMAIN the lead came from — either resolves, matched case-insensitively. Prefer the domain (`provident.ae`, `providentestate.com`); it survives a display-name change. Ask Provident to add your domain before you start sending it.",
+            "example": "provident.ae"
+          },
+
+          "pageUrl": {
+            "type": "string",
+            "nullable": true,
+            "description": "Full URL of the page the submission originated from.",
+            "example": "https://prov.ae/en/dubai-marina?utm_source=google"
+          },
+          "pathLocale": {
+            "type": "string",
+            "maxLength": 32,
+            "nullable": true,
+            "description": "Locale segment of the URL path, e.g. `en`.",
+            "example": "en"
+          },
+          "gclid": { "type": "string", "maxLength": 512, "nullable": true, "description": "Google Ads click id." },
+          "fbclid": { "type": "string", "maxLength": 512, "nullable": true, "description": "Facebook click id." },
+          "utmSource": { "type": "string", "maxLength": 512, "nullable": true, "example": "google" },
+          "utmMedium": { "type": "string", "maxLength": 512, "nullable": true, "example": "cpc" },
+          "utmCampaign": { "type": "string", "maxLength": 512, "nullable": true, "example": "spring-2026" },
+          "utmTerm": { "type": "string", "maxLength": 512, "nullable": true, "example": "dubai marina apartments" },
+          "utmContent": { "type": "string", "maxLength": 512, "nullable": true, "example": "hero-cta" },
+
+          "formName": {
+            "type": "string",
+            "maxLength": 255,
+            "nullable": true,
+            "description": "Name of the web form the visitor submitted.",
+            "example": "contact-popup-form"
+          },
+          "adsetName": {
+            "type": "string",
+            "maxLength": 255,
+            "nullable": true,
+            "description": "Ad set / ad group name on your side. Free text — distinct from the `campaignName` lookup.",
+            "example": "test ww"
+          },
+          "referrer": {
+            "type": "string",
+            "nullable": true,
+            "description": "Referring URL the visitor arrived from.",
+            "example": "https://sobha-city.provident.ae/?utm_source=Google+Ads"
+          },
+          "ipAddress": {
+            "type": "string",
+            "maxLength": 64,
+            "nullable": true,
+            "description": "Submitter IP. IPv4, IPv6 and proxy chains all fit.",
+            "example": "217.165.113.16"
+          },
+          "userAgent": {
+            "type": "string",
+            "nullable": true,
+            "description": "Browser user-agent string captured at submission.",
+            "example": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+          },
+          "submittedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "description": "When the visitor submitted the form on your side. Distinct from the CRM's own createdAt, which is when we received it. An unparseable value is ignored rather than failing the request.",
+            "example": "2026-07-27T13:45:31.728Z"
+          },
+          "localeCountry": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Country code (e.g. AE) or full country name. When omitted, the API attempts to infer it from a trailing two-letter segment of `pageUrl`.",
+            "example": "AE"
+          },
+
+          "assignedBy": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Assign the lead to a specific Provident agent by email address. Omit to let Provident's automatic assignment engine route the lead.",
+            "example": "agent@providentestate.com"
+          },
+
+          "metaFacebook": {
+            "$ref": "#/components/schemas/MetaFacebookPayload"
+          }
+        },
+        "additionalProperties": true
+      },
+      "MetaFacebookPayload": {
+        "type": "object",
+        "description": "Meta / Facebook / Instagram (or TikTok) lead-ads metadata. Send only for leads originating from an ad-platform lead form. Stored alongside the lead; the standard fields above still drive routing.\n\nThe whole object is discarded when `metaLeadId` is absent. `metaLeadId` is unique across the CRM: it prevents the metadata being attached twice, but it does NOT prevent a duplicate lead — de-duplicate on your side.",
+        "properties": {
+          "metaLeadId": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Meta-issued lead id. Required for this block to be stored.",
+            "example": "7636865386872307975"
+          },
+          "metaCreatedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Submission time reported by Meta (ISO-8601).",
+            "example": "2026-05-06T19:38:09.000Z"
+          },
+          "platform": {
+            "type": "string",
+            "maxLength": 32,
+            "description": "Source platform.",
+            "enum": ["facebook", "instagram", "tiktok"],
+            "example": "facebook"
+          },
+          "adId": { "type": "string", "maxLength": 64 },
+          "adName": { "type": "string", "maxLength": 512, "example": "Marina Launch — Video" },
+          "adType": { "type": "string", "maxLength": 64, "example": "Video" },
+          "adgroupId": { "type": "string", "maxLength": 64 },
+          "adgroupName": { "type": "string", "maxLength": 255, "example": "TARGETED" },
+          "metaCampaignId": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Meta's own campaign id — NOT the CRM campaign (use `campaignName` for that)."
+          },
+          "metaCampaignName": { "type": "string", "maxLength": 512, "example": "Marina Q2" },
+          "formId": { "type": "string", "maxLength": 64 },
+          "formName": { "type": "string", "maxLength": 512, "example": "Marina Callback" },
+          "adAccountId": { "type": "string", "maxLength": 64, "example": "act_123456789" },
+          "businessAccountId": { "type": "string", "maxLength": 64 },
+          "sourceAction": { "type": "string", "maxLength": 64, "example": "Form" },
+          "finalPageName": { "type": "string", "maxLength": 255, "example": "Thank You" },
+          "customFields": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Per-form custom question/answer pairs and any other ad-platform-only fields. Keys are preserved verbatim (non-ASCII safe).",
+            "example": {
+              "هل ترغب في حضور هذا المعرض الحصري؟": "نعم",
+              "Preferred call time": "Evening"
+            }
+          }
+        }
+      }
+    }
+  }
+}
