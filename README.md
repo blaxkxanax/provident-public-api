@@ -1,5 +1,12 @@
 # Provident — Lead Intake API
 
+> **This is the single source of truth for the public lead-intake endpoint**, and the
+> version to hand to external developers. The machine-readable twin is
+> [`provident-lead-intake-openapi.json`](./provident-lead-intake-openapi.json) next to
+> this file — keep the two in step when either changes. (Two earlier write-ups,
+> `docs/PUBLIC_LEADS_ENDPOINT.md` and `public-lead-full-example.md`, were folded into
+> this document and deleted on 2026-07-31; nothing else describes this endpoint.)
+
 Server-to-server API for pushing leads into the Provident CRM.
 
 Two endpoints are involved:
@@ -263,16 +270,46 @@ strings or `null` placeholders).
       "Preferred call time": "Evening",
       "Ready to buy": "Within 3 months"
     }
+  },
+
+  "quiz": {
+    "quizKey": "off-plan-investor-2026",
+    "quizName": "Off-plan investor quiz",
+    "locale": "en",
+    "version": "3",
+    "answers": [
+      {
+        "questionKey": "budget",
+        "questionLabel": "What is your budget?",
+        "optionKey": "2m-5m",
+        "answerLabel": "2-5 million",
+        "value": 2000000,
+        "currency": "AED"
+      },
+      {
+        "questionKey": "purchase_date",
+        "questionLabel": "When do you want to buy?",
+        "value": "2026-12-01"
+      },
+      {
+        "questionKey": "interests",
+        "questionLabel": "Interested in?",
+        "optionKey": ["villa", "townhouse"],
+        "answerLabel": ["Villa", "Townhouse"]
+      }
+    ]
   }
 }
 ```
 
-Field-by-field meaning is in §4. Two notes on the example:
+Field-by-field meaning is in §4. Three notes on the example:
 
 - `listingId` and `referenceNo` both identify a listing — send whichever you have.
   If you send both, `listingId` wins.
 - `metaFacebook` is only for leads coming from Meta / Instagram / TikTok lead forms.
   Leave the whole object out for website and other sources.
+- `quiz` is only for landing pages that ask a question set. Unlike every other field
+  here, its questions do **not** need to be agreed with us in advance — see §4.9.
 
 ---
 
@@ -423,12 +460,114 @@ metadata alongside the lead.
 }
 ```
 
-### 4.9 Extra fields you send
+### 4.9 `quiz` — dynamic quiz / survey answers
+
+For landing pages that ask a set of questions ("What is your budget?", "When do you
+want to buy?", dropdowns, and so on). Unlike every other field in this document, the
+questions do **not** have to be agreed with Provident in advance — a new quiz starts
+capturing answers the first time it posts one, with no API change on either side.
+
+Answers are searchable and filterable in the CRM, shown on the lead, and — for
+questions Provident maps to a CRM field — used to fill that field on the lead.
+
+#### The one thing you must get right
+
+**Send a stable `questionKey` for every question, and a stable `optionKey` for every
+dropdown answer.** These are the only language-independent identity an answer has.
+Labels are display text: the same question ships in English and Arabic with different
+wording, the same bracket reads `2-5 million` or `٢-٥ مليون`, and copy gets edited.
+
+- Keys must be **stable across languages** — the Arabic and English versions of one
+  question send the *same* `questionKey`.
+- Keys must be **stable over time** — do not regenerate them when you edit the wording.
+- Keys are **scoped to the quiz**, so `budget` in quiz A and `budget` in quiz B are
+  independent. You do not need globally unique keys.
+
+If you cannot produce keys, still send the labels: answers are kept and stay visible on
+the lead, but each language registers as a separate question until someone at Provident
+merges them by hand, and reporting is split until they do.
+
+#### The block
+
+| Field | Type | Max | Notes |
+|-------|------|-----|-------|
+| `quizKey` | `string` | 128 | Stable identifier for the quiz. **Required** — without it the whole `quiz` object is ignored. |
+| `quizName` | `string` | 255 | Display name. Used the first time this `quizKey` is seen. |
+| `locale` | `string` | 16 | Language the quiz was answered in (`en`, `ar`, `ru`, …). Labels are stored per locale so the CRM shows what the visitor actually saw. |
+| `version` | `string` | 32 | Your version identifier, recorded on each answer. |
+| `answers` | `array` | 60 | The answers, in the order asked. See below. |
+
+Each entry in `answers`:
+
+| Field | Type | Max | Notes |
+|-------|------|-----|-------|
+| `questionKey` | `string` | 128 | Stable machine key. See above. |
+| `questionLabel` | `string` | 512 | The question as shown, in the quiz locale. |
+| `optionKey` | `string` \| `string[]` | 128 each | The chosen option's stable key. **Send an array for multi-select** — each option becomes its own answer record. |
+| `answerLabel` | `string` \| `string[]` | 512 each | The answer as shown. For a dropdown this is the option label; for free text it is the answer itself. |
+| `value` | `string` \| `number` \| `boolean` | — | The machine value when you have one. **Trusted over the label** — sending `2000000` removes any dependence on our parsing of `"٢-٥ مليون"`. |
+| `currency` | `string` | 3 | ISO 4217 for a monetary answer, when the value doesn't imply it. |
+
+```jsonc
+"quiz": {
+  "quizKey": "off-plan-investor-2026",
+  "quizName": "Off-plan investor quiz",
+  "locale": "ar",
+  "version": "3",
+  "answers": [
+    {
+      "questionKey": "budget",
+      "questionLabel": "ما هي ميزانيتك؟",
+      "optionKey": "2m-5m",
+      "answerLabel": "٢-٥ مليون",
+      "value": 2000000,
+      "currency": "AED"
+    },
+    {
+      "questionKey": "purchase_date",
+      "questionLabel": "When do you want to buy?",
+      "value": "2026-12-01"
+    },
+    {
+      "questionKey": "interests",
+      "questionLabel": "Interested in?",
+      "optionKey": ["villa", "townhouse"],
+      "answerLabel": ["Villa", "Townhouse"]
+    }
+  ]
+}
+```
+
+#### How free-text answers are read
+
+Numbers are parsed best-effort, so you do not have to normalize them yourself. All of
+these land as **2000000**: `2 million`, `2,000,000`, `2.000.000`, `2 000 000`, `AED 2M`,
+`2m aed`, `Dirhams 2M`, `٢ مليون`, `٢٠٠٠٠٠٠`. Ranges keep both ends (`2-5 million`,
+`2m to 5m`). Currency words in English and Arabic are recognised and recorded separately.
+
+Dates accept ISO-8601 (`2026-12-01`) and unambiguous text (`1 December 2026`).
+**`03/04/2026` is deliberately rejected** — day-first and month-first are both plausible
+and guessing would file half your leads under the wrong month. Send ISO-8601 or a `value`.
+
+Yes/no answers are recognised across languages (`yes`/`no`, `نعم`/`لا`, `да`/`нет`, …).
+
+Anything that will not parse is **kept verbatim** and flagged for review at Provident —
+it is never dropped, and it never fails your request.
+
+#### Limits
+
+Up to **60 answers per submission** register new questions; anything beyond that is
+still recorded and flagged, but does not extend the catalogue. A quiz is capped at 100
+questions and a question at 200 options. These exist to stop a malformed submission
+growing the catalogue without bound — a real quiz will not come near them.
+
+### 4.10 Extra fields you send
 
 Any field **not** listed above is accepted rather than rejected, so adding a field on
 your side will never start failing your requests. It will not populate a structured
 CRM field either — if you have data that should drive routing or reporting, ask
-Provident to add it to this specification first.
+Provident to add it to this specification first, or send it through `quiz` (§4.9),
+which is designed for exactly that and needs no change on our side.
 
 ---
 
@@ -447,7 +586,9 @@ The intake is deliberately forgiving — **a bad lookup value never loses you a 
 ```jsonc
 "intakeUnresolved": {
   "source": "Web-Site",              // ← the exact string you sent
-  "advertisingCampaign": "Google Ads — Q3"
+  "advertisingCampaign": "Google Ads — Q3",
+  // Quiz answers we could not read, namespaced by quiz key then question key:
+  "quiz.off-plan-investor-2026.free_budget": "somewhere around a lot"
 },
 "needsIntakeReview": true
 ```
@@ -456,6 +597,12 @@ The intake is deliberately forgiving — **a bad lookup value never loses you a 
 A field that consistently appears there means your value doesn't match Provident's
 list — fix the value on your side or ask for the correct spelling. A lead whose
 `source` did not resolve loses its attribution.
+
+Quiz entries (§4.9) behave slightly differently from the rest: the answer **is**
+stored on the lead regardless, and a Provident admin can map the value once so every
+future submission of it resolves automatically. A quiz key appearing here repeatedly
+usually means a free-text question that would be better as a dropdown, or a numeric
+question where sending `value` would remove the guesswork.
 
 ---
 
@@ -744,10 +891,14 @@ pins.
 types map the same way: send the `name` from the filters call as `areaOfInterest`
 and `propertyTypeInterest`.
 
-**Projects do not yet.** The lead payload has no project field; sending `projectId`
-is accepted but ignored (§4.9). To tie a lead to a project, put the project name in
-`initialInquiry`, `campaignName` or `utmCampaign`, or ask Provident to add a
-dedicated field to this specification.
+**Projects have no top-level field.** Sending `projectId` at the top level is accepted
+but ignored (§4.10). Two ways to tie a lead to a project:
+
+- **Via a quiz question (§4.9).** Ask the project as a quiz question and have Provident
+  map that question to the project field — the answer then lands on the lead as a real
+  project link, with no change to this specification. This is the supported route.
+- **Otherwise**, put the project name in `initialInquiry`, `campaignName` or
+  `utmCampaign` and it will at least be searchable as text.
 
 > Approved listings are also readable — `GET /v2/public/listings` and
 > `GET /v2/public/listings/filters` — which is where the `referenceNo` and
@@ -915,6 +1066,12 @@ echo $lead['id'];
 - [ ] Phone numbers sent in E.164 format (`+9715…`).
 - [ ] `source`, `subSource`, `eventType`, `marketingType` values confirmed against
       Provident's accepted lists.
+- [ ] If you send `quiz` (§4.9): every question has a **stable `questionKey`** and every
+      dropdown answer a **stable `optionKey`**, identical across languages and unchanged
+      when the wording is edited. Confirm this before launch — retrofitting keys after
+      leads have arrived means merging the duplicates by hand.
+- [ ] If you send `quiz`: numeric and date answers send a machine `value` where you have
+      one, rather than relying on us parsing the label.
 - [ ] Expected daily volume communicated so the rate limit is sized correctly.
 - [ ] Production egress IPs shared (if IP allowlisting will be enabled).
 - [ ] Production credentials issued and base URL switched to
