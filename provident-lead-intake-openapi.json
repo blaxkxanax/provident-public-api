@@ -1,0 +1,4084 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Provident — Lead Intake API",
+    "version": "1.4.0",
+    "description": "Server-to-server API for pushing leads into the Provident CRM.\n\nCore endpoints:\n1. `POST /oauth2/token` — exchange client credentials for a bearer token.\n2. `POST /public/leads` — create a CRM lead.\n3. `PUT /public/leads/{id}` — add details you did not have when you created it (quiz answers the customer finished afterwards, a budget, an area). Send only what changed; phones and emails are appended, never replaced, and the lead's stage, status, owner and funnel are not writable.\n\nOptional read-only reference data, using the same token: locations, developers, projects and project statuses. Use them to send values that match ours, or to show project content on your own pages. They share the lead endpoint's rate limit, so cache them.\n\nAuthentication is OAuth 2.0 Client Credentials; there is no user login. Note that the `/v2` prefix is part of the server URL and is mandatory.\n\nThe intake is deliberately forgiving: name-based lookup fields that cannot be matched do NOT fail the request — the lead is still created and the unmatched values are returned in `intakeUnresolved`.\n\nThe endpoint is not idempotent at the transport level, but intake hygiene runs before the lead is created: a second enquiry from the same phone/email within the merge window (~24h) is MERGED into the existing lead and returns a different, much shorter 201 body — `{ id, merged: true, matchedOn }` — with no contactId, intakeUnresolved, needsIntakeReview or createdAt. Always branch on `merged` before reading anything else. Enquiries from property-portal sources (Property Finder, Bayut, Dubizzle) are exempt and never merge. Retry only on network timeouts, 429 and 5xx.",
+    "contact": {
+      "name": "Provident API support"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://devapi.prov.ae/v2",
+      "description": "Staging / development — build and test here"
+    },
+    {
+      "url": "https://prodapi.prov.ae/v2",
+      "description": "Production — live leads"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Authentication",
+      "description": "OAuth 2.0 client-credentials token issuance"
+    },
+    {
+      "name": "Lead intake",
+      "description": "Public lead creation"
+    },
+    {
+      "name": "Reference data",
+      "description": "Read-only lookups — locations, developers, projects, project statuses"
+    },
+    {
+      "name": "Lead follow-up",
+      "description": "Reading back who a lead was assigned to, and recording the agent response time"
+    },
+    {
+      "name": "Webhooks",
+      "description": "Calls Provident makes to YOUR server. Documented here for the payload shape; these are not endpoints you call."
+    }
+  ],
+  "paths": {
+    "/oauth2/token": {
+      "post": {
+        "tags": [
+          "Authentication"
+        ],
+        "operationId": "getAccessToken",
+        "summary": "Get an access token (client credentials)",
+        "description": "Exchanges your `client_id` and `client_secret` for a short-lived opaque bearer token. `client_credentials` is the only supported grant type.\n\nCache the token in memory for `expires_in` seconds (refresh ~60 seconds early) — token requests count against your rate limit.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenRequest"
+              },
+              "example": {
+                "grant_type": "client_credentials",
+                "client_id": "YOUR_CLIENT_ID",
+                "client_secret": "YOUR_CLIENT_SECRET"
+              }
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Token issued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenResponse"
+                },
+                "example": {
+                  "access_token": "9f2c1b7d4e8a3c5f6b0d2e4a8c1f3b5d7e9a0c2f4b6d8e0a2c4f6b8d0e2a4c6f",
+                  "token_type": "Bearer",
+                  "expires_in": 3600,
+                  "scope": ""
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid client credentials, unknown client, or unsupported grant type",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "statusCode": 401,
+                  "code": "UNAUTHORIZED",
+                  "message": "Invalid client credentials",
+                  "path": "/v2/oauth2/token",
+                  "timestamp": "2026-07-27T06:28:41.703Z"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/public/leads": {
+      "post": {
+        "tags": [
+          "Lead intake"
+        ],
+        "operationId": "createPublicLead",
+        "summary": "Create a CRM lead",
+        "description": "Creates a lead in the Provident CRM and attaches it to a contact.\n\n**Only hard requirement:** at least one entry in `leadPhones` or `leadEmails`.\n\n**Contact resolution** — an existing contact is matched by phone first, then by email; if nothing matches, a new contact is created from the supplied name/company/phone/email fields. Send phone numbers in E.164 (`+971501234567`) for reliable matching.\n\n**Lookup fields** (`leadType`, `funnel`, `source`, `subSource`, `eventType`, `marketingType`, `campaignName`, `advertisingCampaign`, `website`, `currency`, `localeCountry`, `areaOfInterest`, `propertyTypeInterest`, `marketSegment`, `agentCategory`, `languages`, `assignedBy`, `distributionType`, `listingId`/`referenceNo`) are matched case-insensitively after trimming against lists configured in the CRM. An unmatched value never fails the request — the lead is created and the original text is returned in `intakeUnresolved`.\n\n**Which pipeline the lead lands in** is `funnel`. Omit it and the lead goes to the main sales pipeline, which is where every lead posted to this API went before the field existed; send `Leasing`, `Show Room`, `PvH`, … for an enquiry that belongs to another business line.\n\n**Extra fields** not defined in this schema are accepted and stored verbatim with the lead rather than rejected.\n\n**Not idempotent:** the same payload posted twice creates two leads.\n\n**Quiz answers** — landing pages that ask a question set can send a `quiz` object. Its questions and options register themselves on first sight, so a new quiz needs no API change. Send a stable `questionKey` per question and `optionKey` per dropdown answer: those are the only language-independent identity an answer has, and without them each language registers as a separate question. Free-text numbers are parsed best-effort (`2 million`, `2,000,000`, `AED 2M`, `٢ مليون` → 2000000); ambiguous dates like `03/04/2026` are deliberately refused rather than guessed. Anything unreadable is kept verbatim and flagged, never dropped.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateLeadRequest"
+              },
+              "examples": {
+                "minimal": {
+                  "summary": "Minimum valid request",
+                  "value": {
+                    "leadPhones": [
+                      "+971501234567"
+                    ],
+                    "leadFirstName": "John",
+                    "leadLastName": "Doe"
+                  }
+                },
+                "websiteForm": {
+                  "summary": "Typical website / paid-search form submission",
+                  "value": {
+                    "leadPhones": [
+                      "+971501234567"
+                    ],
+                    "leadEmails": [
+                      "john.doe@example.com"
+                    ],
+                    "leadFirstName": "John",
+                    "leadLastName": "Doe",
+                    "leadType": "Primary",
+                    "source": "Website",
+                    "subSource": [
+                      "Callback Form"
+                    ],
+                    "eventType": "Submit Form",
+                    "marketingType": "Paid",
+                    "website": "provident.ae",
+                    "campaignName": "Spring 2026 Landing Page",
+                    "developerName": "Sobha Realty",
+                    "formName": "contact-popup-form",
+                    "areaOfInterest": "Dubai Marina",
+                    "propertyTypeInterest": "Apartment",
+                    "budgetMin": "1000000",
+                    "budgetMax": "2500000",
+                    "currency": "AED",
+                    "initialInquiry": "Looking for a 2BR with sea view, ready Q4.",
+                    "languages": [
+                      "English",
+                      "ar"
+                    ],
+                    "localeCountry": "AE",
+                    "pageUrl": "https://prov.ae/en/dubai-marina",
+                    "pathLocale": "en",
+                    "gclid": "Cj0KCQ...",
+                    "utmSource": "google",
+                    "utmMedium": "cpc",
+                    "utmCampaign": "spring-2026",
+                    "utmTerm": "dubai marina apartments",
+                    "utmContent": "hero-cta",
+                    "integrationRef": "make:meta-leadgen-eu"
+                  }
+                },
+                "allFields": {
+                  "summary": "Every supported field — send as much of this as you have",
+                  "description": "The complete surface of the endpoint. Nothing is required except one phone or email; omit fields you do not have rather than sending empty strings or nulls.",
+                  "value": {
+                    "leadPhones": [
+                      "+971501234567",
+                      "+971559876543"
+                    ],
+                    "leadEmails": [
+                      "john.doe@example.com",
+                      "j.doe@work.example.com"
+                    ],
+                    "leadFirstName": "John",
+                    "leadMiddleName": "Ahmad",
+                    "leadSecondName": "A.",
+                    "leadLastName": "Doe",
+                    "leadCompanyName": "Acme Real Estate",
+                    "leadType": "Primary",
+                    "priority": "High",
+                    "marketSegment": "Luxury",
+                    "agentCategory": "A",
+                    "areaOfInterest": "Dubai Marina",
+                    "propertyTypeInterest": "Apartment",
+                    "budgetMin": "1000000",
+                    "budgetMax": "2500000",
+                    "currency": "AED",
+                    "initialInquiry": "Looking for a 2BR with sea view, ready to move in Q4.",
+                    "languages": [
+                      "English",
+                      "ar"
+                    ],
+                    "listingId": "8f3c1e2a-1122-3344-5566-778899aabbcc",
+                    "referenceNo": "PR-123456",
+                    "source": "Website",
+                    "subSource": [
+                      "Callback Form",
+                      "Team Page"
+                    ],
+                    "marketingType": "Paid",
+                    "eventType": "Submit Form",
+                    "campaignName": "Spring 2026 Landing Page",
+                    "advertisingCampaign": "Google Ads — Q3",
+                    "developerName": "Sobha Realty",
+                    "website": "provident.ae",
+                    "pageUrl": "https://prov.ae/en/dubai-marina?utm_source=google&utm_medium=cpc",
+                    "pathLocale": "en",
+                    "gclid": "Cj0KCQjw1234567890",
+                    "fbclid": "IwAR2abcdefghijklmno",
+                    "utmSource": "google",
+                    "utmMedium": "cpc",
+                    "utmCampaign": "spring-2026",
+                    "utmTerm": "dubai marina apartments",
+                    "utmContent": "hero-cta",
+                    "formName": "contact-popup-form",
+                    "adsetName": "test ww",
+                    "referrer": "https://sobha-city.provident.ae/?utm_source=Google+Ads",
+                    "ipAddress": "217.165.113.16",
+                    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                    "submittedAt": "2026-07-27T13:45:31.728Z",
+                    "localeCountry": "AE",
+                    "assignedBy": "agent@providentestate.com",
+                    "metaFacebook": {
+                      "metaLeadId": "7636865386872307975",
+                      "metaCreatedAt": "2026-05-06T19:38:09.000Z",
+                      "platform": "facebook",
+                      "adId": "120000000000",
+                      "adName": "Marina Launch — Video",
+                      "adType": "Video",
+                      "adgroupId": "930000000000",
+                      "adgroupName": "TARGETED",
+                      "metaCampaignId": "230000000000",
+                      "metaCampaignName": "Marina Q2",
+                      "formId": "550000000000",
+                      "formName": "Marina Callback",
+                      "adAccountId": "act_123456789",
+                      "businessAccountId": "456789123",
+                      "sourceAction": "Form",
+                      "finalPageName": "Thank You",
+                      "customFields": {
+                        "هل ترغب في حضور هذا المعرض الحصري؟": "نعم",
+                        "Preferred call time": "Evening",
+                        "Ready to buy": "Within 3 months"
+                      }
+                    },
+                    "quiz": {
+                      "quizKey": "off-plan-investor-2026",
+                      "quizName": "Off-plan investor quiz",
+                      "locale": "ar",
+                      "version": "3",
+                      "answers": [
+                        {
+                          "questionKey": "budget",
+                          "questionLabel": "ما هي ميزانيتك؟",
+                          "optionKey": "2m-5m",
+                          "answerLabel": "٢-٥ مليون",
+                          "value": 2000000,
+                          "currency": "AED"
+                        },
+                        {
+                          "questionKey": "purchase_date",
+                          "questionLabel": "متى ترغب في الشراء؟",
+                          "value": "2026-12-01"
+                        },
+                        {
+                          "questionKey": "interests",
+                          "questionLabel": "ما الذي يهمك؟",
+                          "optionKey": [
+                            "villa",
+                            "townhouse"
+                          ],
+                          "answerLabel": [
+                            "فيلا",
+                            "تاون هاوس"
+                          ]
+                        }
+                      ]
+                    },
+                    "integrationRef": "make:meta-leadgen-eu"
+                  }
+                },
+                "metaLeadAd": {
+                  "summary": "Meta / Facebook lead-ad submission",
+                  "value": {
+                    "leadPhones": [
+                      "+971559876543"
+                    ],
+                    "leadEmails": [
+                      "sara@example.com"
+                    ],
+                    "leadFirstName": "Sara",
+                    "leadLastName": "Ahmad",
+                    "leadType": "Primary",
+                    "source": "Facebook",
+                    "eventType": "Submit Form",
+                    "marketingType": "Paid",
+                    "campaignName": "Marina Q2",
+                    "marketSegment": "Luxury",
+                    "agentCategory": "A",
+                    "languages": [
+                      "ar"
+                    ],
+                    "metaFacebook": {
+                      "metaLeadId": "7636865386872307975",
+                      "metaCreatedAt": "2026-05-06T19:38:09.000Z",
+                      "platform": "facebook",
+                      "adId": "120000000000",
+                      "adName": "Marina Launch — Video",
+                      "adType": "Video",
+                      "adgroupId": "930000000000",
+                      "adgroupName": "TARGETED",
+                      "metaCampaignId": "230000000000",
+                      "metaCampaignName": "Marina Q2",
+                      "formId": "550000000000",
+                      "formName": "Marina Callback",
+                      "adAccountId": "act_123456789",
+                      "businessAccountId": "456789123",
+                      "sourceAction": "Form",
+                      "finalPageName": "Thank You",
+                      "customFields": {
+                        "هل ترغب في حضور هذا المعرض الحصري؟": "نعم",
+                        "Preferred call time": "Evening"
+                      }
+                    },
+                    "integrationRef": "make:meta-leadgen-eu"
+                  }
+                },
+                "quizSubmission": {
+                  "summary": "Landing page with a dynamic quiz (Arabic)",
+                  "description": "A quiz answered in Arabic. The option keys are identical to the English version of the same quiz, so both resolve to the same answer in reporting.",
+                  "value": {
+                    "leadPhones": [
+                      "+971501234567"
+                    ],
+                    "leadFirstName": "John",
+                    "source": "Website",
+                    "website": "provident.ae",
+                    "quiz": {
+                      "quizKey": "off-plan-investor-2026",
+                      "quizName": "Off-plan investor quiz",
+                      "locale": "ar",
+                      "version": "3",
+                      "answers": [
+                        {
+                          "questionKey": "budget",
+                          "questionLabel": "ما هي ميزانيتك؟",
+                          "optionKey": "2m-5m",
+                          "answerLabel": "٢-٥ مليون",
+                          "value": 2000000,
+                          "currency": "AED"
+                        },
+                        {
+                          "questionKey": "purchase_date",
+                          "questionLabel": "متى ترغب في الشراء؟",
+                          "value": "2026-12-01"
+                        },
+                        {
+                          "questionKey": "interests",
+                          "questionLabel": "ما الذي يهمك؟",
+                          "optionKey": [
+                            "villa",
+                            "townhouse"
+                          ],
+                          "answerLabel": [
+                            "فيلا",
+                            "تاون هاوس"
+                          ]
+                        }
+                      ]
+                    },
+                    "integrationRef": "make:meta-leadgen-eu"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Accepted. EITHER a new lead (CreatedLead) OR an enquiry merged into an existing one (MergedLead) — branch on `merged` before reading any other field. A CreatedLead body carries many further fields that are not part of this contract.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/XRateLimitLimit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/XRateLimitRemaining"
+              },
+              "X-RateLimit-Reset": {
+                "$ref": "#/components/headers/XRateLimitReset"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/CreatedLead"
+                    },
+                    {
+                      "$ref": "#/components/schemas/MergedLead"
+                    }
+                  ]
+                },
+                "examples": {
+                  "createdLead": {
+                    "summary": "A new lead",
+                    "value": {
+                      "id": "a1b2c3d4-5566-7788-99aa-bbccddeeff00",
+                      "merged": false,
+                      "contactId": "0f1e2d3c-4455-6677-8899-aabbccddeeff",
+                      "intakeUnresolved": {
+                        "advertisingCampaign": "Google Ads — Q3"
+                      },
+                      "needsIntakeReview": true,
+                      "isRepeatLead": false,
+                      "repeatOfLeadId": null,
+                      "isAgentEnquiry": false,
+                      "agentEnquiryReason": null,
+                      "createdAt": "2026-07-27T06:31:04.512Z",
+                      "assignedTo": null
+                    }
+                  },
+                  "repeatLead": {
+                    "summary": "A new lead, outside the merge window, marked as a repeat",
+                    "value": {
+                      "id": "b2c3d4e5-6677-8899-aabb-ccddeeff0011",
+                      "merged": false,
+                      "contactId": "0f1e2d3c-4455-6677-8899-aabbccddeeff",
+                      "intakeUnresolved": null,
+                      "needsIntakeReview": false,
+                      "isRepeatLead": true,
+                      "repeatOfLeadId": "a1b2c3d4-5566-7788-99aa-bbccddeeff00",
+                      "isAgentEnquiry": false,
+                      "agentEnquiryReason": null,
+                      "createdAt": "2026-07-29T09:02:11.004Z"
+                    }
+                  },
+                  "mergedEnquiry": {
+                    "summary": "Merged into an existing lead — note the missing fields",
+                    "value": {
+                      "id": "a1b2c3d4-5566-7788-99aa-bbccddeeff00",
+                      "merged": true,
+                      "matchedOn": "phone"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Neither a phone nor an email was supplied, or the body was not valid JSON. Do not retry unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "examples": {
+                  "noContactPoint": {
+                    "summary": "No phone and no email",
+                    "value": {
+                      "statusCode": 400,
+                      "code": "BAD_REQUEST",
+                      "message": "Provide at least one value in leadPhones or leadEmails",
+                      "path": "/v2/public/leads",
+                      "timestamp": "2026-07-27T06:31:04.512Z"
+                    }
+                  },
+                  "invalidJson": {
+                    "summary": "Malformed JSON body",
+                    "value": {
+                      "statusCode": 400,
+                      "code": "INVALID_JSON",
+                      "message": "Invalid JSON payload",
+                      "path": "/v2/public/leads",
+                      "timestamp": "2026-07-27T06:31:04.512Z"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, revoked or expired bearer token. Fetch a new token and retry once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "examples": {
+                  "missing": {
+                    "summary": "No Authorization header",
+                    "value": {
+                      "statusCode": 401,
+                      "code": "OAUTH_TOKEN_MISSING",
+                      "message": "OAuth token missing",
+                      "path": "/v2/public/leads",
+                      "timestamp": "2026-07-27T06:28:41.816Z"
+                    }
+                  },
+                  "expired": {
+                    "summary": "Token past expiry",
+                    "value": {
+                      "statusCode": 401,
+                      "code": "OAUTH_TOKEN_EXPIRED",
+                      "message": "OAuth access token expired",
+                      "path": "/v2/public/leads",
+                      "timestamp": "2026-07-27T06:28:41.816Z"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller's IP address is not on the allowlist configured for this client.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "statusCode": 403,
+                  "code": "FORBIDDEN",
+                  "message": "Access denied. Your IP address (203.0.113.10) is not permitted.",
+                  "path": "/v2/public/leads",
+                  "timestamp": "2026-07-27T06:31:04.512Z"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "description": "Server-side failure. Retry with exponential backoff.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "statusCode": 500,
+                  "code": "INTERNAL_ERROR",
+                  "message": "Internal server error",
+                  "path": "/v2/public/leads",
+                  "timestamp": "2026-07-27T06:31:04.512Z"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/public/projects/filters": {
+      "get": {
+        "tags": [
+          "Reference data"
+        ],
+        "operationId": "getProjectFilters",
+        "summary": "Locations, developers, property types and statuses",
+        "description": "Returns every lookup list in one call. There is no standalone locations endpoint — this is where locations come from.\n\nUse `filters.location.values[].name` as the lead's `areaOfInterest` and `filters.propertyType.values[].name` as `propertyTypeInterest` so those values resolve instead of landing in `intakeUnresolved`. The UUIDs are the ones accepted by the project list filters.\n\nThese lists change rarely — cache them (a daily refresh is plenty) rather than calling per lead, since reference reads share the lead endpoint's rate limit.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Filter lists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectFiltersResponse"
+                },
+                "example": {
+                  "filters": {
+                    "developer": {
+                      "displayName": "Developer",
+                      "values": [
+                        {
+                          "id": "11111111-1111-1111-1111-111111111111",
+                          "name": "Emaar"
+                        }
+                      ]
+                    },
+                    "location": {
+                      "displayName": "Location",
+                      "values": [
+                        {
+                          "id": "22222222-2222-2222-2222-222222222222",
+                          "name": "Dubai Marina",
+                          "fullName": "Dubai"
+                        }
+                      ]
+                    },
+                    "propertyType": {
+                      "displayName": "Property Type",
+                      "values": [
+                        {
+                          "id": "33333333-3333-3333-3333-333333333333",
+                          "name": "Apartment"
+                        }
+                      ]
+                    },
+                    "status": {
+                      "displayName": "Status",
+                      "values": [
+                        {
+                          "id": "44444444-4444-4444-4444-444444444444",
+                          "name": "Off-plan",
+                          "color": "#00aaaa"
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/public/locations/search": {
+      "get": {
+        "tags": [
+          "Reference data"
+        ],
+        "operationId": "searchLocations",
+        "summary": "Search communities and areas",
+        "description": "Type-ahead over the whole location tree, relevance-ranked when a term is given. Omit the term to page the tree. Offset-paged like the developers endpoint; `page` is rejected with 422.\n\nA lead has no location-id field — `areaOfInterest` is matched by NAME — so send `name`, and show `path` in your picker: hundreds of leaf names repeat across the tree, and an ambiguous name cannot be linked.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Search"
+          },
+          {
+            "$ref": "#/components/parameters/SearchAliasQ"
+          },
+          {
+            "$ref": "#/components/parameters/SearchAliasQuery"
+          },
+          {
+            "$ref": "#/components/parameters/LimitCapped"
+          },
+          {
+            "$ref": "#/components/parameters/Offset"
+          },
+          {
+            "$ref": "#/components/parameters/Sort"
+          },
+          {
+            "$ref": "#/components/parameters/Order"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Locations, offset-paged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicLocationListResponse"
+                },
+                "example": {
+                  "data": [
+                    {
+                      "id": "22222222-2222-2222-2222-222222222222",
+                      "name": "Dubai Marina",
+                      "level": "2",
+                      "path": "Dubai, Dubai Marina"
+                    },
+                    {
+                      "id": "33333333-3333-3333-3333-333333333333",
+                      "name": "Marina",
+                      "level": "3",
+                      "path": "Ajman, Al Zorah, Marina"
+                    }
+                  ],
+                  "meta": {
+                    "limit": 20,
+                    "offset": 0,
+                    "total": 350
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationFailed"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/public/locations/{id}": {
+      "get": {
+        "tags": [
+          "Reference data"
+        ],
+        "operationId": "getLocation",
+        "summary": "Get one community or area",
+        "description": "For re-displaying a location the visitor picked earlier.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Location UUID.",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Location",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicLocation"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/public/developers": {
+      "get": {
+        "tags": [
+          "Reference data"
+        ],
+        "operationId": "listDevelopers",
+        "summary": "List developers",
+        "description": "Paginated list of enabled developers. CHANGED 2026-08: this endpoint moved from `page`/`limit` to `limit`/`offset`, and `meta` from `{page, limit, total, totalPages}` to `{limit, offset, total}`. `page` is no longer accepted — sending it returns 422, it is not ignored.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/LimitCapped"
+          },
+          {
+            "$ref": "#/components/parameters/Offset"
+          },
+          {
+            "$ref": "#/components/parameters/Search"
+          },
+          {
+            "$ref": "#/components/parameters/SearchAliasQ"
+          },
+          {
+            "$ref": "#/components/parameters/SearchAliasQuery"
+          },
+          {
+            "$ref": "#/components/parameters/Sort"
+          },
+          {
+            "$ref": "#/components/parameters/Order"
+          },
+          {
+            "$ref": "#/components/parameters/Popular"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Developers, offset-paged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeveloperListResponse"
+                },
+                "example": {
+                  "data": [
+                    {
+                      "id": "11111111-1111-1111-1111-111111111111",
+                      "name": "Emaar",
+                      "slug": "emaar",
+                      "logoUrl": "https://media.prov.ae/public/developers/emaar-logo.png",
+                      "imageUrl": "https://media.prov.ae/public/developers/emaar-cover.jpg",
+                      "description": "Master developer.",
+                      "enabled": true,
+                      "popular": true,
+                      "contactId": null,
+                      "createdAt": "2026-07-21T10:09:32.393Z",
+                      "updatedAt": "2026-07-21T10:09:32.393Z"
+                    }
+                  ],
+                  "meta": {
+                    "limit": 50,
+                    "offset": 0,
+                    "total": 244
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationFailed"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/public/developers/search": {
+      "get": {
+        "tags": [
+          "Reference data"
+        ],
+        "operationId": "searchDevelopers",
+        "summary": "Search developers",
+        "description": "Matches the term against developer name, slug and description, ranking exact-name matches first. Falls back to the plain list when no term is given. CHANGED 2026-08: this endpoint moved from `page`/`limit` to `limit`/`offset`, and `meta` from `{page, limit, total, totalPages}` to `{limit, offset, total}`. `page` is no longer accepted — sending it returns 422, it is not ignored. Relevance-ranked against the search term (name, slug, description and id); falls back to the plain list when no term is given.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/LimitCapped"
+          },
+          {
+            "$ref": "#/components/parameters/Offset"
+          },
+          {
+            "$ref": "#/components/parameters/Search"
+          },
+          {
+            "$ref": "#/components/parameters/SearchAliasQ"
+          },
+          {
+            "$ref": "#/components/parameters/SearchAliasQuery"
+          },
+          {
+            "$ref": "#/components/parameters/Sort"
+          },
+          {
+            "$ref": "#/components/parameters/Order"
+          },
+          {
+            "$ref": "#/components/parameters/Popular"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Developers, offset-paged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeveloperListResponse"
+                },
+                "example": {
+                  "data": [
+                    {
+                      "id": "11111111-1111-1111-1111-111111111111",
+                      "name": "Emaar",
+                      "slug": "emaar",
+                      "logoUrl": "https://media.prov.ae/public/developers/emaar-logo.png",
+                      "imageUrl": "https://media.prov.ae/public/developers/emaar-cover.jpg",
+                      "description": "Master developer.",
+                      "enabled": true,
+                      "popular": true,
+                      "contactId": null,
+                      "createdAt": "2026-07-21T10:09:32.393Z",
+                      "updatedAt": "2026-07-21T10:09:32.393Z"
+                    }
+                  ],
+                  "meta": {
+                    "limit": 50,
+                    "offset": 0,
+                    "total": 244
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationFailed"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/public/developers/{id}": {
+      "get": {
+        "tags": [
+          "Reference data"
+        ],
+        "operationId": "getDeveloper",
+        "summary": "Get one developer",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Developer UUID.",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Developer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Developer"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "Not found, or the developer is disabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/public/projects": {
+      "get": {
+        "tags": [
+          "Reference data"
+        ],
+        "operationId": "listProjects",
+        "summary": "List published projects",
+        "description": "Paginated, filterable list of published projects. Returns the compact shape by default; pass `simplified=false` for the full record.\n\nThe UUIDs accepted by `developerIds`, `locationIds`, `statusIds` and `propertyTypes` all come from `GET /public/projects/filters`.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "description": "Free-text search.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "developerIds",
+            "in": "query",
+            "required": false,
+            "description": "Comma-separated developer UUIDs. Alias: `developerId`.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "locationIds",
+            "in": "query",
+            "required": false,
+            "description": "Comma-separated location UUIDs. Alias: `locationId`.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "statusIds",
+            "in": "query",
+            "required": false,
+            "description": "Comma-separated status UUIDs. Alias: `statusId`.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "propertyTypes",
+            "in": "query",
+            "required": false,
+            "description": "Comma-separated property-type UUIDs. Alias: `propertyType`.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "minPrice",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "maxPrice",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "deliveryFrom",
+            "in": "query",
+            "required": false,
+            "description": "Handover date lower bound.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "deliveryTo",
+            "in": "query",
+            "required": false,
+            "description": "Handover date upper bound.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "ownershipType",
+            "in": "query",
+            "required": false,
+            "description": "Value from the filters call.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "campaignType",
+            "in": "query",
+            "required": false,
+            "description": "Value from the filters call.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "stockAvailability",
+            "in": "query",
+            "required": false,
+            "description": "Value from the filters call.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "simplified",
+            "in": "query",
+            "required": false,
+            "description": "`true` (default) returns the compact project shape; `false` returns the full record.",
+            "schema": {
+              "type": "boolean",
+              "default": true
+            }
+          },
+          {
+            "$ref": "#/components/parameters/Page"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "order",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "asc",
+                "desc"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated projects",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectListResponse"
+                },
+                "example": {
+                  "data": [
+                    {
+                      "id": "55555555-5555-5555-5555-555555555555",
+                      "title": "Marina Heights",
+                      "slug": "marina-heights",
+                      "campaignType": "Launch",
+                      "propertyTypes": [
+                        "Apartment",
+                        "Penthouse"
+                      ],
+                      "startingPrice": "1200000",
+                      "deliveryDate": "2027-06-30T00:00:00.000Z",
+                      "brochure": true,
+                      "paymentPlans": [
+                        "60/40"
+                      ],
+                      "developer": {
+                        "name": "Emaar"
+                      },
+                      "location": {
+                        "id": "22222222-2222-2222-2222-222222222222",
+                        "name": "Dubai Marina",
+                        "fullPath": "Dubai | Dubai Marina",
+                        "parentName": "Dubai"
+                      },
+                      "image": {
+                        "url": "https://media.prov.ae/public/projects/images/marina-heights.jpg",
+                        "sortOrder": 0
+                      },
+                      "status": {
+                        "id": "44444444-4444-4444-4444-444444444444",
+                        "name": "Off-plan"
+                      }
+                    }
+                  ],
+                  "meta": {
+                    "page": 1,
+                    "limit": 20,
+                    "total": 84,
+                    "totalPages": 5
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/public/projects/map": {
+      "get": {
+        "tags": [
+          "Reference data"
+        ],
+        "operationId": "listProjectsOnMap",
+        "summary": "Published projects inside a bounding box",
+        "description": "Map pins for published projects within the given viewport. Accepts the same filter parameters as the project list. Returns `{ \"data\": [] }` when any bound is not a finite number.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "latMin",
+            "in": "query",
+            "required": true,
+            "description": "South-west corner latitude.",
+            "schema": {
+              "type": "number"
+            }
+          },
+          {
+            "name": "latMax",
+            "in": "query",
+            "required": true,
+            "description": "North-east corner latitude.",
+            "schema": {
+              "type": "number"
+            }
+          },
+          {
+            "name": "lngMin",
+            "in": "query",
+            "required": true,
+            "description": "South-west corner longitude.",
+            "schema": {
+              "type": "number"
+            }
+          },
+          {
+            "name": "lngMax",
+            "in": "query",
+            "required": true,
+            "description": "North-east corner longitude.",
+            "schema": {
+              "type": "number"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "developerIds",
+            "in": "query",
+            "required": false,
+            "description": "Comma-separated developer UUIDs.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "locationIds",
+            "in": "query",
+            "required": false,
+            "description": "Comma-separated location UUIDs.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "statusIds",
+            "in": "query",
+            "required": false,
+            "description": "Comma-separated status UUIDs.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "propertyTypes",
+            "in": "query",
+            "required": false,
+            "description": "Comma-separated property-type UUIDs.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Map pins",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/public/projects/{id}": {
+      "get": {
+        "tags": [
+          "Reference data"
+        ],
+        "operationId": "getProject",
+        "summary": "Get one published project",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Project UUID.",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "simplified",
+            "in": "query",
+            "required": false,
+            "description": "`true` (default) returns the compact shape; `false` returns the full record.",
+            "schema": {
+              "type": "boolean",
+              "default": true
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Project",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectSimplified"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "Not found, or the project is not published",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/public/project-statuses": {
+      "get": {
+        "tags": [
+          "Reference data"
+        ],
+        "operationId": "listProjectStatuses",
+        "summary": "List project statuses",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Project statuses",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ProjectStatus"
+                  }
+                },
+                "example": [
+                  {
+                    "id": "44444444-4444-4444-4444-444444444444",
+                    "name": "Off-plan",
+                    "color": "#00aaaa"
+                  }
+                ]
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/public/leads/{id}": {
+      "put": {
+        "tags": [
+          "Lead follow-up"
+        ],
+        "summary": "Update a lead — details that arrive later",
+        "description": "For the case where you do not have the whole enquiry at once: the name, email and phone go in with POST /public/leads, and the quiz answers, budget and area follow minutes or hours later.\n\nSend only what changed. An omitted field is left alone, an explicit null clears the column, and a value that matches no CRM record leaves the column as it was rather than blanking it — a typo never erases a good value. A field you do send wins over what the lead had, including a value an agent typed, so only send fields you are authoritative about.\n\nleadPhones and leadEmails are APPENDED, never replaced, so re-sending the one number you know is free. Quiz answers supersede the previous answers for the same quizKey, which makes a retry idempotent.\n\nThe lead's workflow is not writable here at all: stage, status, assigned agent, funnel board and the aging clock stay Provident’s, whatever is sent.\n\nNew details DO send a lead nobody holds back through the assignment engine (see `rerouted`); a lead an agent already holds is never taken off them. Every update that changes something also posts a note on the lead's timeline naming your integration and what changed.\n\nPATCH is accepted as an alias for the same operation — the semantics are PATCH’s either way. This is not a way around the merge window: if the customer enquires again, POST it.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Lead id returned by POST /public/leads. A merged id works too — it is the surviving lead."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateLeadRequest"
+              },
+              "example": {
+                "budgetMin": "1200000",
+                "budgetMax": "1800000",
+                "areaOfInterest": "Dubai Marina",
+                "quiz": {
+                  "quizKey": "buyer_qualification_v2",
+                  "quizName": "Buyer qualification",
+                  "locale": "en",
+                  "answers": [
+                    {
+                      "questionKey": "timeframe",
+                      "label": "When are you looking to buy?",
+                      "optionKeys": [
+                        "3_6_months"
+                      ]
+                    },
+                    {
+                      "questionKey": "purpose",
+                      "label": "Purpose",
+                      "value": "Investment"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Applied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdatedLead"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Body was not valid JSON, or the id is not a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "No such lead, or it has been deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "Lead follow-up"
+        ],
+        "summary": "Update a lead (alias of PUT)",
+        "description": "For the case where you do not have the whole enquiry at once: the name, email and phone go in with POST /public/leads, and the quiz answers, budget and area follow minutes or hours later.\n\nSend only what changed. An omitted field is left alone, an explicit null clears the column, and a value that matches no CRM record leaves the column as it was rather than blanking it — a typo never erases a good value. A field you do send wins over what the lead had, including a value an agent typed, so only send fields you are authoritative about.\n\nleadPhones and leadEmails are APPENDED, never replaced, so re-sending the one number you know is free. Quiz answers supersede the previous answers for the same quizKey, which makes a retry idempotent.\n\nThe lead's workflow is not writable here at all: stage, status, assigned agent, funnel board and the aging clock stay Provident’s, whatever is sent.\n\nNew details DO send a lead nobody holds back through the assignment engine (see `rerouted`); a lead an agent already holds is never taken off them. Every update that changes something also posts a note on the lead's timeline naming your integration and what changed.\n\nPATCH is accepted as an alias for the same operation — the semantics are PATCH’s either way. This is not a way around the merge window: if the customer enquires again, POST it.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Lead id returned by POST /public/leads. A merged id works too — it is the surviving lead."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateLeadRequest"
+              },
+              "example": {
+                "budgetMin": "1200000",
+                "budgetMax": "1800000",
+                "areaOfInterest": "Dubai Marina",
+                "quiz": {
+                  "quizKey": "buyer_qualification_v2",
+                  "quizName": "Buyer qualification",
+                  "locale": "en",
+                  "answers": [
+                    {
+                      "questionKey": "timeframe",
+                      "label": "When are you looking to buy?",
+                      "optionKeys": [
+                        "3_6_months"
+                      ]
+                    },
+                    {
+                      "questionKey": "purpose",
+                      "label": "Purpose",
+                      "value": "Investment"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Applied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdatedLead"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Body was not valid JSON, or the id is not a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "No such lead, or it has been deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/public/leads/{id}/assignment": {
+      "get": {
+        "tags": [
+          "Lead follow-up"
+        ],
+        "summary": "Who a lead was assigned to",
+        "description": "For most leads the agent is chosen by a routing engine that runs AFTER POST /public/leads has answered, so an ownerless lead on the create response is normal. This tells you whether an agent is coming.\n\nPoll ~30s after creating the lead, then every `retryAfterSeconds` while `status` is `pending`, and stop at ~2 minutes. `assigned`, `unassigned` and `pool` are FINAL — stop polling. Better still, take the `lead.assigned` webhook and do not poll at all.\n\nReturns the agent's work contacts and the status only — nothing about the customer or the enquiry.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Lead id returned by POST /public/leads. A merged id works too."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Assignment state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LeadAssignment"
+                },
+                "examples": {
+                  "assigned": {
+                    "summary": "An agent owns it — contact them",
+                    "value": {
+                      "leadId": "a1b2c3d4-5566-7788-99aa-bbccddeeff00",
+                      "status": "assigned",
+                      "agent": {
+                        "id": "3f2a91c4-7e10-4b8d-9c33-2a5b6d7e8f90",
+                        "slug": "sarah-ahmed",
+                        "name": "Sarah Ahmed",
+                        "email": "sarah.ahmed@providentestate.com",
+                        "phone": "+971501234567",
+                        "whatsappPhone": "+971501234567",
+                        "active": true
+                      },
+                      "createdAt": "2026-08-24T09:14:02.881Z",
+                      "retryAfterSeconds": null
+                    }
+                  },
+                  "pending": {
+                    "summary": "Routing has not finished — ask again, say nothing yet",
+                    "value": {
+                      "leadId": "a1b2c3d4-5566-7788-99aa-bbccddeeff00",
+                      "status": "pending",
+                      "agent": null,
+                      "createdAt": "2026-08-24T09:14:02.881Z",
+                      "retryAfterSeconds": 30
+                    }
+                  },
+                  "unassigned": {
+                    "summary": "Nobody took it — FINAL, send the generic reply",
+                    "value": {
+                      "leadId": "a1b2c3d4-5566-7788-99aa-bbccddeeff00",
+                      "status": "unassigned",
+                      "agent": null,
+                      "createdAt": "2026-08-24T09:14:02.881Z",
+                      "retryAfterSeconds": null
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The id is not a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "No such lead, or it has been deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/public/leads/{id}/response-time": {
+      "post": {
+        "tags": [
+          "Lead follow-up"
+        ],
+        "summary": "Record the agent's response time on a lead",
+        "description": "How long the assigned agent took to respond, in whole seconds from the customer's first contact. Last write wins, so retrying is safe. Timing is not sensitive — minutes or hours after the fact is fine. `agentRespondedAt` is stamped by Provident, not by you.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Lead id returned by POST /public/leads. A merged id works too."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResponseTimeRequest"
+              },
+              "example": {
+                "seconds": 47
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResponseTimeResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The id is not a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "No such lead, or it has been deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`seconds` missing, not an integer, negative, or over the 30-day cap",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "Opaque",
+        "description": "The `access_token` returned by `POST /oauth2/token`, sent as `Authorization: Bearer <access_token>`. It is an opaque string, not a JWT."
+      }
+    },
+    "headers": {
+      "XRateLimitLimit": {
+        "description": "Requests allowed in the current window.",
+        "schema": {
+          "type": "integer"
+        }
+      },
+      "XRateLimitRemaining": {
+        "description": "Requests remaining in the current window.",
+        "schema": {
+          "type": "integer"
+        }
+      },
+      "XRateLimitReset": {
+        "description": "Seconds until the counter resets (end of the UTC day).",
+        "schema": {
+          "type": "integer"
+        }
+      }
+    },
+    "parameters": {
+      "Limit": {
+        "name": "limit",
+        "in": "query",
+        "required": false,
+        "description": "Page size.",
+        "schema": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "LimitCapped": {
+        "name": "limit",
+        "in": "query",
+        "required": false,
+        "description": "Page size, default 50, clamped to 200. `meta.limit` echoes the value actually applied, not what was asked for.",
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200,
+          "default": 50
+        }
+      },
+      "Offset": {
+        "name": "offset",
+        "in": "query",
+        "required": false,
+        "description": "Records to skip.",
+        "schema": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
+        }
+      },
+      "Order": {
+        "name": "order",
+        "in": "query",
+        "required": false,
+        "description": "Default direction for sort keys that do not carry one.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "asc",
+            "desc"
+          ],
+          "default": "asc"
+        }
+      },
+      "Page": {
+        "name": "page",
+        "in": "query",
+        "required": false,
+        "description": "1-indexed page number. Projects only — the developers and locations endpoints reject it with 422.",
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1
+        }
+      },
+      "Popular": {
+        "name": "popular",
+        "in": "query",
+        "required": false,
+        "description": "Omit for all enabled developers; `true` / `false` filters by the popular flag.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
+        }
+      },
+      "Search": {
+        "name": "search",
+        "in": "query",
+        "required": false,
+        "description": "Search term. Aliases `q` and `query` are accepted for the same value.",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "SearchAliasQ": {
+        "name": "q",
+        "in": "query",
+        "required": false,
+        "description": "Alias for `search`.",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "SearchAliasQuery": {
+        "name": "query",
+        "in": "query",
+        "required": false,
+        "description": "Alias for `search`.",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "Sort": {
+        "name": "sort",
+        "in": "query",
+        "required": false,
+        "description": "CSV of sort keys, most significant first; each may carry its own direction (`name:desc`, `-name`). Unknown keys are ignored.",
+        "schema": {
+          "type": "string",
+          "example": "popular:desc,name:asc"
+        }
+      }
+    },
+    "responses": {
+      "Unauthorized": {
+        "description": "Missing, invalid, revoked or expired bearer token.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            },
+            "example": {
+              "statusCode": 401,
+              "code": "OAUTH_TOKEN_EXPIRED",
+              "message": "OAuth access token expired",
+              "path": "/v2/public/projects/filters",
+              "timestamp": "2026-07-27T06:31:04.512Z"
+            }
+          }
+        }
+      },
+      "RateLimited": {
+        "description": "Request quota for this client exceeded. Wait `Retry-After` seconds, then resume.",
+        "headers": {
+          "Retry-After": {
+            "description": "Seconds to wait before retrying.",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          "X-RateLimit-Limit": {
+            "$ref": "#/components/headers/XRateLimitLimit"
+          },
+          "X-RateLimit-Remaining": {
+            "$ref": "#/components/headers/XRateLimitRemaining"
+          },
+          "X-RateLimit-Reset": {
+            "$ref": "#/components/headers/XRateLimitReset"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            },
+            "example": {
+              "statusCode": 429,
+              "code": "RATE_LIMITED",
+              "message": "Too Many Requests",
+              "path": "/v2/public/leads",
+              "timestamp": "2026-07-27T06:31:04.512Z"
+            }
+          }
+        }
+      },
+      "ValidationFailed": {
+        "description": "A parameter or field failed validation. Note that an UNRECOGNISED query parameter is rejected, not ignored — this is how a call written against the old `page`-based developers endpoint now fails. Fix the request; never retry it unchanged.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            },
+            "example": {
+              "statusCode": 422,
+              "code": "VALIDATION_ERROR",
+              "message": "Validation failed",
+              "errors": [
+                "property page should not exist"
+              ],
+              "path": "/v2/public/developers?page=1&limit=2",
+              "timestamp": "2026-08-19T07:20:28.507Z"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "TokenRequest": {
+        "type": "object",
+        "required": [
+          "grant_type",
+          "client_id",
+          "client_secret"
+        ],
+        "properties": {
+          "grant_type": {
+            "type": "string",
+            "enum": [
+              "client_credentials"
+            ],
+            "description": "The only supported grant type."
+          },
+          "client_id": {
+            "type": "string",
+            "description": "Client id issued by Provident (per environment)."
+          },
+          "client_secret": {
+            "type": "string",
+            "description": "Client secret issued by Provident. Server-side use only — never expose it in a browser or mobile app."
+          }
+        }
+      },
+      "TokenResponse": {
+        "type": "object",
+        "properties": {
+          "access_token": {
+            "type": "string",
+            "description": "Opaque bearer token. Send as `Authorization: Bearer <access_token>`."
+          },
+          "token_type": {
+            "type": "string",
+            "example": "Bearer"
+          },
+          "expires_in": {
+            "type": "integer",
+            "description": "Seconds until the token expires (typically 3600).",
+            "example": 3600
+          },
+          "scope": {
+            "type": "string",
+            "description": "Space-separated scopes granted to the client. May be empty."
+          }
+        }
+      },
+      "ApiError": {
+        "type": "object",
+        "description": "Common error envelope used by every endpoint.",
+        "properties": {
+          "statusCode": {
+            "type": "integer",
+            "example": 400
+          },
+          "code": {
+            "type": "string",
+            "description": "Stable machine-readable error code — branch on this, not on `message`.",
+            "example": "BAD_REQUEST"
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable description."
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Present on 422 only: one entry per field that failed validation."
+          },
+          "details": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Optional structured extras attached by the failing handler."
+          },
+          "path": {
+            "type": "string",
+            "example": "/v2/public/leads"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "PaginationMeta": {
+        "type": "object",
+        "properties": {
+          "page": {
+            "type": "integer",
+            "example": 1
+          },
+          "limit": {
+            "type": "integer",
+            "example": 50
+          },
+          "total": {
+            "type": "integer",
+            "example": 120
+          },
+          "totalPages": {
+            "type": "integer",
+            "example": 3
+          }
+        },
+        "description": "Page-based paging envelope. Used by the projects endpoints only."
+      },
+      "FilterValue": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "additionalProperties": true
+      },
+      "LocationFilterValue": {
+        "type": "object",
+        "description": "A location. Send `name` as the lead's `areaOfInterest`; `id` is what the project filters accept.",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string",
+            "nullable": true,
+            "example": "Dubai Marina"
+          },
+          "fullName": {
+            "type": "string",
+            "nullable": true,
+            "description": "Parent location — use it to tell similarly named areas apart.",
+            "example": "Dubai"
+          }
+        }
+      },
+      "FilterGroup": {
+        "type": "object",
+        "properties": {
+          "displayName": {
+            "type": "string"
+          },
+          "values": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FilterValue"
+            }
+          }
+        }
+      },
+      "ProjectFiltersResponse": {
+        "type": "object",
+        "properties": {
+          "filters": {
+            "type": "object",
+            "properties": {
+              "developer": {
+                "$ref": "#/components/schemas/FilterGroup"
+              },
+              "location": {
+                "type": "object",
+                "properties": {
+                  "displayName": {
+                    "type": "string"
+                  },
+                  "values": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/LocationFilterValue"
+                    }
+                  }
+                }
+              },
+              "propertyType": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/FilterGroup"
+                  }
+                ],
+                "description": "Send a value's `name` as the lead's `propertyTypeInterest`."
+              },
+              "status": {
+                "type": "object",
+                "properties": {
+                  "displayName": {
+                    "type": "string"
+                  },
+                  "values": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/ProjectStatus"
+                    }
+                  }
+                }
+              },
+              "campaignType": {
+                "$ref": "#/components/schemas/FilterGroup"
+              },
+              "ownershipType": {
+                "$ref": "#/components/schemas/FilterGroup"
+              },
+              "stockAvailability": {
+                "$ref": "#/components/schemas/FilterGroup"
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "ProjectStatus": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string",
+            "nullable": true,
+            "example": "Off-plan"
+          },
+          "color": {
+            "type": "string",
+            "nullable": true,
+            "example": "#00aaaa"
+          }
+        },
+        "additionalProperties": true
+      },
+      "Developer": {
+        "type": "object",
+        "description": "An enabled developer. Additional fields may be present; only these are contractual.",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string",
+            "example": "Emaar"
+          },
+          "slug": {
+            "type": "string",
+            "example": "emaar"
+          },
+          "logoUrl": {
+            "type": "string",
+            "nullable": true
+          },
+          "imageUrl": {
+            "type": "string",
+            "nullable": true
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          },
+          "popular": {
+            "type": "boolean"
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Always true — only enabled developers are returned."
+          },
+          "contactId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": true
+      },
+      "DeveloperListResponse": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Developer"
+            }
+          },
+          "meta": {
+            "$ref": "#/components/schemas/OffsetMeta"
+          }
+        }
+      },
+      "ProjectLocation": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string",
+            "nullable": true,
+            "example": "Dubai Marina"
+          },
+          "fullPath": {
+            "type": "string",
+            "nullable": true,
+            "example": "Dubai | Dubai Marina"
+          },
+          "parentId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "parentName": {
+            "type": "string",
+            "nullable": true,
+            "example": "Dubai"
+          },
+          "level": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "additionalProperties": true
+      },
+      "ProjectImage": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "nullable": true
+          },
+          "originalFileName": {
+            "type": "string"
+          },
+          "mimeType": {
+            "type": "string",
+            "nullable": true
+          },
+          "sortOrder": {
+            "type": "integer",
+            "nullable": true
+          }
+        },
+        "additionalProperties": true
+      },
+      "ProjectSimplified": {
+        "type": "object",
+        "description": "Compact project shape (the default). Additional fields may be present; only these are contractual.",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "title": {
+            "type": "string",
+            "nullable": true,
+            "example": "Marina Heights"
+          },
+          "slug": {
+            "type": "string",
+            "nullable": true
+          },
+          "campaignType": {
+            "type": "string",
+            "nullable": true
+          },
+          "propertyTypes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "startingPrice": {
+            "type": "string",
+            "nullable": true
+          },
+          "deliveryDate": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "brochure": {
+            "type": "boolean"
+          },
+          "paymentPlans": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "developer": {
+            "type": "object",
+            "nullable": true,
+            "properties": {
+              "name": {
+                "type": "string",
+                "nullable": true
+              }
+            }
+          },
+          "location": {
+            "$ref": "#/components/schemas/ProjectLocation"
+          },
+          "image": {
+            "$ref": "#/components/schemas/ProjectImage"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ProjectStatus"
+          }
+        },
+        "additionalProperties": true
+      },
+      "ProjectListResponse": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProjectSimplified"
+            }
+          },
+          "meta": {
+            "$ref": "#/components/schemas/PaginationMeta"
+          }
+        }
+      },
+      "CreatedLead": {
+        "type": "object",
+        "description": "A newly created lead (`merged` is false). The response actually carries the whole lead record; only the properties listed here are contractual and safe to depend on.",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "UUID of the created lead. Store this against your own submission record."
+          },
+          "contactId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "UUID of the contact the lead was attached to (matched or newly created)."
+          },
+          "intakeUnresolved": {
+            "type": "object",
+            "nullable": true,
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Map of field name → the original value you sent, for every lookup value that could not be matched. `null` when everything resolved. Quiz answers that could not be read appear namespaced as `quiz.<quizKey>.<questionKey>` — unlike a failed lookup, the answer IS still stored on the lead, and a Provident admin can map the value once so every future submission of it resolves automatically.",
+            "example": {
+              "source": "Web-Site",
+              "quiz.off-plan-investor-2026.free_budget": "somewhere around a lot"
+            }
+          },
+          "needsIntakeReview": {
+            "type": "boolean",
+            "description": "`true` when `intakeUnresolved` is non-empty."
+          },
+          "merged": {
+            "type": "boolean",
+            "enum": [
+              false
+            ],
+            "description": "Always `false` here. `true` means the enquiry was folded into an existing lead — see MergedLead."
+          },
+          "isRepeatLead": {
+            "type": "boolean",
+            "description": "True when this person already had a lead older than the merge window. The lead is routed and worked normally; this is a marker, not a routing instruction."
+          },
+          "repeatOfLeadId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "The earlier lead's id when `isRepeatLead` is true, otherwise null."
+          },
+          "isAgentEnquiry": {
+            "type": "boolean",
+            "description": "True when the enquiry was recognised as coming from a competing agent rather than a buyer. The lead is still created and worked; the flag keeps it out of lead-volume and cost-per-lead reporting."
+          },
+          "agentEnquiryReason": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "known_agent",
+              "prior_lead",
+              "competitor_domain",
+              "manual",
+              null
+            ],
+            "description": "Why, when `isAgentEnquiry` is true; null otherwise."
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "assignedTo": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Agent"
+              }
+            ],
+            "nullable": true,
+            "description": "The agent the lead landed on. NULL means 'not decided yet' — the routing engine runs after this response is sent — NOT 'nobody'. Reliable only when you sent referenceNo/listingId or assignedBy; otherwise use GET /public/leads/{id}/assignment or the lead.assigned webhook."
+          }
+        },
+        "additionalProperties": true
+      },
+      "CreateLeadRequest": {
+        "type": "object",
+        "description": "Lead intake payload. At least one entry in `leadPhones` or `leadEmails` is required; every other field is optional. Unknown fields are accepted and stored verbatim with the lead.",
+        "properties": {
+          "leadPhones": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "description": "Phone numbers. Used FIRST to match an existing contact. Use E.164 format for reliable matching. Required unless `leadEmails` is supplied.",
+            "example": [
+              "+971501234567"
+            ]
+          },
+          "leadEmails": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 255
+            },
+            "description": "Email addresses. Used to match an existing contact when no phone matches. Required unless `leadPhones` is supplied.",
+            "example": [
+              "john.doe@example.com"
+            ]
+          },
+          "leadFirstName": {
+            "type": "string",
+            "maxLength": 255,
+            "nullable": true,
+            "example": "John"
+          },
+          "leadMiddleName": {
+            "type": "string",
+            "maxLength": 255,
+            "nullable": true,
+            "example": "Ahmad"
+          },
+          "leadSecondName": {
+            "type": "string",
+            "maxLength": 255,
+            "nullable": true,
+            "description": "Second given name — used when no middle name is supplied.",
+            "example": "A."
+          },
+          "leadLastName": {
+            "type": "string",
+            "maxLength": 255,
+            "nullable": true,
+            "example": "Doe"
+          },
+          "leadCompanyName": {
+            "type": "string",
+            "maxLength": 255,
+            "nullable": true,
+            "description": "Company name for corporate enquiries.",
+            "example": "Acme Real Estate"
+          },
+          "leadType": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Lead type display name, e.g. `Primary Buyer`, `Secondary Buyer`, `Primary Buyer and Secondary Buyer`, `Tenant`, `Landlord`, `Broker`, `Seller`, `Owner`, `Mortgages`. Ask Provident for the full list. The shorthand `Primary` / `Secondary` / `Primary and Secondary` is accepted as an alias for the corresponding `… Buyer` type, in either direction. Omit this on a listing enquiry and it is derived from the listing — see `listingId`.",
+            "example": "Primary Buyer"
+          },
+          "funnel": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Which CRM funnel (pipeline) the enquiry belongs to. OMIT IT for the main sales pipeline — that is the default and what almost every lead wants. Send a value only for an enquiry that belongs to a different business line: `Leasing`, `Show Room`, `PvH`, `Mortgages`, `Property Management`, `Landlord/Sellers Listings`, `Provident the Agency`, `Events`, `Recruitment`, `Precision Inspections`, `811 services`, `Prism`. The display name or the stable key both work (`Show Room` and `show_room` are the same funnel), matched case-insensitively and ignoring spaces, hyphens and underscores. Deliberately NOT derived from `leadType`: a Tenant enquiry can belong to Leasing or PvH and a Primary Buyer to sales, Show Room or the Agency — only the sender knows which. An unrecognised funnel does not fail the request: the lead is created on the main sales pipeline and the value is returned in `intakeUnresolved.funnel`.",
+            "example": "Leasing"
+          },
+          "priority": {
+            "type": "string",
+            "maxLength": 64,
+            "nullable": true,
+            "description": "Free text priority indicator.",
+            "example": "High"
+          },
+          "marketSegment": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Marketing's segmentation of the lead.",
+            "enum": [
+              "Standard",
+              "Luxury",
+              "Super Luxury"
+            ],
+            "example": "Luxury"
+          },
+          "agentCategory": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Marketing's grading of the lead.",
+            "enum": [
+              "A",
+              "B",
+              "C",
+              "D"
+            ],
+            "example": "A"
+          },
+          "areaOfInterest": {
+            "type": "string",
+            "nullable": true,
+            "description": "LOOKUP. Location the lead is interested in.",
+            "example": "Dubai Marina"
+          },
+          "propertyTypeInterest": {
+            "type": "string",
+            "maxLength": 255,
+            "nullable": true,
+            "description": "LOOKUP. Property type the lead is interested in. Matched case-insensitively after trimming, and a regular English plural also matches the singular catalogue entry (`Apartments` → `Apartment`, `Townhouses` → `Townhouse`), so a form offering plural choices needs no mapping on your side.",
+            "example": "Apartment"
+          },
+          "budgetMin": {
+            "type": "string",
+            "nullable": true,
+            "description": "Minimum budget. Numeric string; a JSON number is also accepted.",
+            "example": "1000000"
+          },
+          "budgetMax": {
+            "type": "string",
+            "nullable": true,
+            "description": "Maximum budget. Numeric string; a JSON number is also accepted.",
+            "example": "2500000"
+          },
+          "currency": {
+            "type": "string",
+            "maxLength": 3,
+            "description": "LOOKUP. ISO 4217 currency code for the budget values.",
+            "example": "AED"
+          },
+          "initialInquiry": {
+            "type": "string",
+            "nullable": true,
+            "description": "Free-text message or callback reason from the form.",
+            "example": "Looking for a 2BR with sea view, ready to move in Q4."
+          },
+          "languages": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 255
+            },
+            "description": "LOOKUP. Languages the lead speaks, by code or name. Unrecognised entries are ignored.",
+            "example": [
+              "ar",
+              "English"
+            ]
+          },
+          "listingId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "LOOKUP. Provident listing UUID. Takes precedence over `referenceNo` when both are sent.\n\nA resolved listing also fills in what the form did not ask. Each field below is taken from the listing ONLY where this payload leaves it empty — anything you send always wins, and a quiz answer mapped to the same field beats the listing too:\n- `leadType` — from the listing category and offering type: Primary -> Primary Buyer, Secondary -> Secondary Buyer, and any rental listing -> Tenant whatever its category.\n- developer, location, property type, bedrooms, currency — copied from the listing. The location fills the lead's own location and does not overwrite `areaOfInterest`.\n- `budgetMin` — the listing price, unless the price is on application or it would exceed a `budgetMax` you sent. `budgetMax` is never derived.\n\nSending a value we then fail to match (an unknown developer name, say) is still reported in `intakeUnresolved` even though the listing goes on to fill that field.\n\nThe listing's own agent, where it has one, becomes the lead owner and wins over `assignedBy`."
+          },
+          "referenceNo": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "LOOKUP. Listing reference number, used when `listingId` is not supplied. A reference number matching MORE THAN ONE listing counts as unresolved, and nothing is inherited. See `listingId` for what a resolved listing fills in.",
+            "example": "PR-123456"
+          },
+          "source": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Lead source. Send this — an unrecognised or omitted source leaves the lead with no source attribution.",
+            "example": "Website"
+          },
+          "subSource": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 255
+            },
+            "description": "LOOKUP. Sub-sources. Only those linked to the resolved `source` are kept; ignored entirely when `source` did not resolve.",
+            "example": [
+              "Callback Form",
+              "Team Page"
+            ]
+          },
+          "marketingType": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Marketing type, e.g. Organic or Paid.",
+            "example": "Organic"
+          },
+          "eventType": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. What the user did — e.g. Submit Form, Call, Whatsapp Click, DM, Webpush, Gamification.",
+            "example": "Submit Form"
+          },
+          "campaignName": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. CRM campaign name.",
+            "example": "Spring 2026 Landing Page"
+          },
+          "advertisingCampaign": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "CREATED ON FIRST SIGHT. Advertising campaign name — the one field here that is not a strict lookup: a name Provident has never seen creates the campaign instead of being discarded. Omit it when you send `metaFacebook`; the Meta campaign fills it.",
+            "example": "Google Ads — Q3"
+          },
+          "developerName": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Developer the enquiry is about, matched on name or slug — `Sobha Realty` or `sobha-realty`. Values come from `GET /public/developers`.",
+            "example": "Sobha Realty"
+          },
+          "developerId": {
+            "type": "string",
+            "description": "Developer uuid from `GET /public/developers`. Takes precedence over `developerName`; a non-uuid value here is treated as a name instead of being discarded.",
+            "example": "8ecf4fcd-ec63-5764-8524-7cd917494dbe"
+          },
+          "website": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Website NAME or DOMAIN the lead came from — either resolves, matched case-insensitively. Prefer the domain (`provident.ae`, `providentestate.com`); it survives a display-name change. Ask Provident to add your domain before you start sending it.",
+            "example": "provident.ae"
+          },
+          "pageUrl": {
+            "type": "string",
+            "nullable": true,
+            "description": "Full URL of the page the submission originated from.",
+            "example": "https://prov.ae/en/dubai-marina?utm_source=google"
+          },
+          "pathLocale": {
+            "type": "string",
+            "maxLength": 32,
+            "nullable": true,
+            "description": "Locale segment of the URL path, e.g. `en`.",
+            "example": "en"
+          },
+          "gclid": {
+            "type": "string",
+            "maxLength": 512,
+            "nullable": true,
+            "description": "Google Ads click id."
+          },
+          "fbclid": {
+            "type": "string",
+            "maxLength": 512,
+            "nullable": true,
+            "description": "Facebook click id."
+          },
+          "utmSource": {
+            "type": "string",
+            "maxLength": 512,
+            "nullable": true,
+            "example": "google"
+          },
+          "utmMedium": {
+            "type": "string",
+            "maxLength": 512,
+            "nullable": true,
+            "example": "cpc"
+          },
+          "utmCampaign": {
+            "type": "string",
+            "maxLength": 512,
+            "nullable": true,
+            "example": "spring-2026"
+          },
+          "utmTerm": {
+            "type": "string",
+            "maxLength": 512,
+            "nullable": true,
+            "example": "dubai marina apartments"
+          },
+          "utmContent": {
+            "type": "string",
+            "maxLength": 512,
+            "nullable": true,
+            "example": "hero-cta"
+          },
+          "formName": {
+            "type": "string",
+            "maxLength": 255,
+            "nullable": true,
+            "description": "Name of the web form the visitor submitted. Falls back to `metaFacebook.formName` (truncated to 255) when omitted.",
+            "example": "contact-popup-form"
+          },
+          "adsetName": {
+            "type": "string",
+            "maxLength": 255,
+            "nullable": true,
+            "description": "Ad set / ad group name on your side. Free text — distinct from the `campaignName` lookup. Falls back to `metaFacebook.adgroupName` (truncated to 255) when omitted.",
+            "example": "test ww"
+          },
+          "referrer": {
+            "type": "string",
+            "nullable": true,
+            "description": "Referring URL the visitor arrived from.",
+            "example": "https://sobha-city.provident.ae/?utm_source=Google+Ads"
+          },
+          "ipAddress": {
+            "type": "string",
+            "maxLength": 64,
+            "nullable": true,
+            "description": "Submitter IP. IPv4, IPv6 and proxy chains all fit.",
+            "example": "217.165.113.16"
+          },
+          "userAgent": {
+            "type": "string",
+            "nullable": true,
+            "description": "Browser user-agent string captured at submission.",
+            "example": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+          },
+          "submittedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "description": "When the visitor submitted the form on your side. Distinct from the CRM's own createdAt, which is when we received it. An unparseable value is ignored rather than failing the request.",
+            "example": "2026-07-27T13:45:31.728Z"
+          },
+          "localeCountry": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Country code (e.g. AE) or full country name. When omitted, the API attempts to infer it from a trailing two-letter segment of `pageUrl`.",
+            "example": "AE"
+          },
+          "assignedBy": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Assign the lead to a specific Provident agent by email address. Omit to let Provident's automatic assignment engine route the lead. When the lead also resolves a listing that has an agent of its own, the listing's agent wins.",
+            "example": "agent@providentestate.com"
+          },
+          "distributionType": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "How you would like this lead routed. This is a HINT, not an instruction: the value is stored on the lead and only affects who receives it if Provident has configured a routing rule that looks at it. By default nothing looks at it, so sending one is safe and changes nothing.\n\nMatched case-insensitively after trimming; the leading word on its own also works (`campaign`, `personal`, `developer`, `language`, `default`, `roadshow`).\n\nAn unrecognised value is stored exactly as sent rather than rejected — a lead is never lost over this field, it simply matches no rule.\n\n`Personal distribution` carries one extra meaning: it marks the lead as having a named owner, and such a lead is never re-assigned automatically and runs no follow-up clock at all. It only takes effect together with a resolved `assignedBy` — the two fields are one instruction. If `assignedBy` is missing or names nobody we can match, the lead is still created and routed normally but the marker is dropped, and both values come back in `intakeUnresolved`.\n\n**Omit it and a Meta lead form can carry it instead.** A `Distribution` or `Distribution Type` entry in `metaFacebook.customFields` is read as a fallback and normalised the same way, because the value is usually set by whoever built the ad form rather than by whoever posts the lead. A top-level `distributionType` always wins.",
+            "enum": [
+              "Personal distribution",
+              "Campaign distribution",
+              "Developer distribution",
+              "Language distribution",
+              "Default distribution",
+              "Developer and Area distribution",
+              "Area distribution Secondary",
+              "Roadshow distribution"
+            ],
+            "example": "Campaign distribution"
+          },
+          "metaFacebook": {
+            "$ref": "#/components/schemas/MetaFacebookPayload"
+          },
+          "quiz": {
+            "$ref": "#/components/schemas/QuizSubmission"
+          },
+          "integrationRef": {
+            "type": "string",
+            "maxLength": 128,
+            "nullable": true,
+            "description": "Your handle for the specific automation behind this lead — a Make scenario name, a webhook id, a form build. Free text: stored verbatim, never matched against anything, and never reported in `intakeUnresolved`.\n\nIt identifies an INTEGRATION, not a submission, so keep it stable across every lead that automation sends; a per-lead unique id makes it useless for grouping. Values are only distinguished within one sender, so two partners can both use `scenario-1`.\n\nDo NOT put your own name here. The submitting OAuth client is recorded automatically from the access token — there is no field for it, because attribution a sender can write is not attribution.",
+            "example": "make:meta-leadgen-eu"
+          }
+        },
+        "additionalProperties": true
+      },
+      "MetaFacebookPayload": {
+        "type": "object",
+        "description": "Meta / Facebook / Instagram (or TikTok) lead-ads metadata. Send only for leads originating from an ad-platform lead form. The standard fields above still drive routing.\n\nStored alongside the lead AND copied onto it: `metaCampaignId` + `metaCampaignName` become the lead's advertising campaign (matched on the Meta campaign id, and created if Provident has never seen it, so campaign names need no prior agreement); `finalPageName`, `adName`/`adId`, `adgroupName`/`adgroupId` and `formName`/`formId` become filterable columns on the lead. Matching on the id is what makes a rename safe — rename a campaign in Ads Manager and its leads stay on one campaign in the CRM. `campaignName` is a different, strictly-matched field: the CRM's own campaign, which drives routing.\n\nThe whole object is discarded when `metaLeadId` is absent. `metaLeadId` is unique across the CRM: it prevents the metadata being attached twice, but it does NOT prevent a duplicate lead — de-duplicate on your side.",
+        "properties": {
+          "metaLeadId": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Meta-issued lead id. Required for this block to be stored.",
+            "example": "7636865386872307975"
+          },
+          "metaCreatedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Submission time reported by Meta (ISO-8601).",
+            "example": "2026-05-06T19:38:09.000Z"
+          },
+          "platform": {
+            "type": "string",
+            "maxLength": 32,
+            "description": "Source platform. The short forms `fb` and `ig` are accepted and normalised to `facebook` / `instagram`, so a sender forwarding Meta verbatim needs no translation; anything else is stored lowercased rather than rejected.",
+            "enum": [
+              "facebook",
+              "instagram",
+              "tiktok",
+              "fb",
+              "ig"
+            ],
+            "example": "facebook"
+          },
+          "adId": {
+            "type": "string",
+            "maxLength": 64
+          },
+          "adName": {
+            "type": "string",
+            "maxLength": 512,
+            "example": "Marina Launch — Video"
+          },
+          "adType": {
+            "type": "string",
+            "maxLength": 64,
+            "example": "Video"
+          },
+          "adgroupId": {
+            "type": "string",
+            "maxLength": 64
+          },
+          "adgroupName": {
+            "type": "string",
+            "maxLength": 255,
+            "example": "TARGETED",
+            "description": "Ad set / ad group name. Also fills the lead's `adsetName` when you send no top-level one."
+          },
+          "metaCampaignId": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Meta's own campaign id — NOT the CRM campaign (use `campaignName` for that)."
+          },
+          "metaCampaignName": {
+            "type": "string",
+            "maxLength": 512,
+            "example": "Marina Q2"
+          },
+          "formId": {
+            "type": "string",
+            "maxLength": 64
+          },
+          "formName": {
+            "type": "string",
+            "maxLength": 512,
+            "example": "Marina Callback",
+            "description": "Meta lead-form name. Also fills the lead's `formName` when you send no top-level one."
+          },
+          "adAccountId": {
+            "type": "string",
+            "maxLength": 64,
+            "example": "act_123456789"
+          },
+          "businessAccountId": {
+            "type": "string",
+            "maxLength": 64
+          },
+          "sourceAction": {
+            "type": "string",
+            "maxLength": 64,
+            "example": "Form"
+          },
+          "finalPageName": {
+            "type": "string",
+            "maxLength": 255,
+            "example": "Thank You",
+            "description": "The Facebook/Instagram page the ad ran under. Copied onto the lead."
+          },
+          "customFields": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Per-form custom question/answer pairs and any other ad-platform-only fields. Keys are preserved verbatim (non-ASCII safe).",
+            "example": {
+              "هل ترغب في حضور هذا المعرض الحصري؟": "نعم",
+              "Preferred call time": "Evening"
+            }
+          }
+        }
+      },
+      "QuizAnswer": {
+        "type": "object",
+        "description": "One answer to one quiz question. `questionKey` (and `optionKey` for dropdowns) are the contract: they are the only language-independent identity an answer has. Labels are display text and change with language and copy edits, so they are never used for matching when a key is present.",
+        "properties": {
+          "questionKey": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Stable machine key for the question, unique within the quiz. Must be the SAME across languages and stable over time — do not regenerate it when you edit the wording. Without it the answer is keyed off a hash of its label and will not merge with the same question in another language.",
+            "example": "budget"
+          },
+          "questionLabel": {
+            "type": "string",
+            "maxLength": 512,
+            "description": "The question as shown to the visitor, in the quiz locale.",
+            "example": "ما هي ميزانيتك؟"
+          },
+          "optionKey": {
+            "description": "Stable machine key of the chosen option, for select questions. Send an ARRAY for multi-select — each option becomes its own answer record.",
+            "oneOf": [
+              {
+                "type": "string",
+                "maxLength": 128
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "maxLength": 128
+                }
+              }
+            ],
+            "example": "2m-5m"
+          },
+          "answerLabel": {
+            "description": "The answer as shown to the visitor. For a select answer this is the option label; for free text it is the answer itself. Array form pairs positionally with an array `optionKey`.",
+            "oneOf": [
+              {
+                "type": "string",
+                "maxLength": 512
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "maxLength": 512
+                }
+              }
+            ],
+            "example": "٢-٥ مليون"
+          },
+          "value": {
+            "description": "Machine value when you have one — a number, boolean, or ISO-8601 date string. TRUSTED OVER THE LABEL: sending 2000000 removes any dependence on our parsing of \"٢-٥ مليون\". Free-text numbers are parsed best-effort instead (\"2 million\", \"2,000,000\", \"AED 2M\", \"٢ مليون\" all resolve to 2000000); an unparseable value is kept verbatim and flagged for review rather than dropped.",
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              }
+            ],
+            "example": 2000000
+          },
+          "currency": {
+            "type": "string",
+            "maxLength": 3,
+            "description": "ISO 4217 currency for a monetary answer, when the value does not imply it.",
+            "example": "AED"
+          }
+        },
+        "additionalProperties": false
+      },
+      "QuizSubmission": {
+        "type": "object",
+        "description": "A dynamic quiz / survey submitted with the lead — for landing pages that ask a set of questions. Unlike every other field in this API, the questions do NOT have to be agreed with Provident in advance: questions and options register themselves the first time they arrive, so a new quiz starts capturing answers with no API change on either side. Answers are searchable in the CRM, shown on the lead, and — for questions Provident maps to a CRM field — used to fill that field on the lead itself.",
+        "properties": {
+          "quizKey": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Stable identifier for the quiz. REQUIRED — without it the whole `quiz` object is ignored. Keys are scoped to the quiz, so `budget` in quiz A and `budget` in quiz B are independent; you do not need globally unique question keys.",
+            "example": "off-plan-investor-2026"
+          },
+          "quizName": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "Display name. Used the first time this `quizKey` is seen.",
+            "example": "Off-plan investor quiz"
+          },
+          "locale": {
+            "type": "string",
+            "maxLength": 16,
+            "description": "Language the quiz was answered in. Labels are stored per locale so the CRM shows what the visitor actually saw.",
+            "example": "ar"
+          },
+          "version": {
+            "type": "string",
+            "maxLength": 32,
+            "description": "Your version identifier for the quiz, recorded on each answer.",
+            "example": "3"
+          },
+          "answers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QuizAnswer"
+            },
+            "maxItems": 60,
+            "description": "The answers, in the order the questions were asked. Up to 60 per submission register new questions; anything beyond is still recorded and flagged for review, but does not extend the catalogue. A quiz is capped at 100 questions and a question at 200 options."
+          }
+        },
+        "additionalProperties": false
+      },
+      "MergedLead": {
+        "type": "object",
+        "description": "The enquiry was folded into a lead created inside the merge window (~24h) rather than creating a new one. The status is still 201 but the body is ONLY these four fields: there is no contactId, intakeUnresolved, needsIntakeReview or createdAt. `id` is a lead you already have — do not record it as a second submission. `assignedTo` is usually populated here (the lead already exists, so its owner is already known).",
+        "required": [
+          "id",
+          "merged",
+          "matchedOn"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "UUID of the EXISTING lead the enquiry was folded into."
+          },
+          "merged": {
+            "type": "boolean",
+            "enum": [
+              true
+            ],
+            "description": "Always `true` here."
+          },
+          "matchedOn": {
+            "type": "string",
+            "enum": [
+              "phone",
+              "email"
+            ],
+            "description": "Which identifier matched the existing lead. Phone is checked before email."
+          },
+          "assignedTo": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Agent"
+              }
+            ],
+            "nullable": true,
+            "description": "The agent who already owns the lead the enquiry was folded into, or null if it has none."
+          }
+        },
+        "additionalProperties": false
+      },
+      "OffsetMeta": {
+        "type": "object",
+        "description": "Offset paging envelope. `limit` echoes the value actually applied after clamping, not what was asked for.",
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "example": 50
+          },
+          "offset": {
+            "type": "integer",
+            "example": 0
+          },
+          "total": {
+            "type": "integer",
+            "example": 244,
+            "description": "Unpaginated row count for the query."
+          }
+        }
+      },
+      "PublicLocation": {
+        "type": "object",
+        "description": "One node of the community / area tree, trimmed for public use.",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string",
+            "example": "Dubai Marina",
+            "description": "The leaf name. This is the value to send as a lead's `areaOfInterest` — but see `path`: names are NOT unique, and a name matching more than one node cannot be matched to a lead and comes back in `intakeUnresolved`."
+          },
+          "level": {
+            "type": "string",
+            "nullable": true,
+            "example": "2",
+            "description": "Depth in the tree, as a string."
+          },
+          "path": {
+            "type": "string",
+            "example": "Ajman, Al Zorah, Marina",
+            "description": "Full ancestry, for telling two similarly named areas apart in a picker."
+          }
+        }
+      },
+      "PublicLocationListResponse": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PublicLocation"
+            }
+          },
+          "meta": {
+            "$ref": "#/components/schemas/OffsetMeta"
+          }
+        }
+      },
+      "Agent": {
+        "type": "object",
+        "description": "An agent, as returned anywhere in this API. Work contacts only — personal numbers are never published.",
+        "required": [
+          "id",
+          "slug",
+          "name",
+          "email",
+          "phone",
+          "whatsappPhone",
+          "active"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Portal user id. The stable, immutable identifier for an agent — key your records on this."
+          },
+          "slug": {
+            "type": "string",
+            "nullable": true,
+            "description": "Website profile segment (/team/<slug>/), or null if not published. Human-readable but admin-editable; `id` is not.",
+            "example": "sarah-ahmed"
+          },
+          "name": {
+            "type": "string",
+            "nullable": true,
+            "description": "Display name. Safe to say to a customer.",
+            "example": "Sarah Ahmed"
+          },
+          "email": {
+            "type": "string",
+            "nullable": true,
+            "description": "Work email."
+          },
+          "phone": {
+            "type": "string",
+            "nullable": true,
+            "description": "Work phone."
+          },
+          "whatsappPhone": {
+            "type": "string",
+            "nullable": true,
+            "description": "The number to open a WhatsApp chat on. Read this field rather than reusing `phone` — they differ for some agents."
+          },
+          "active": {
+            "type": "boolean",
+            "description": "False for a deactivated account. Do not route work to them."
+          }
+        }
+      },
+      "LeadAssignment": {
+        "type": "object",
+        "description": "Who a lead ended up with. Branch on `status`, not on whether `agent` is set.",
+        "required": [
+          "leadId",
+          "status",
+          "agent",
+          "createdAt",
+          "retryAfterSeconds"
+        ],
+        "properties": {
+          "leadId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "assigned",
+              "pending",
+              "unassigned",
+              "pool"
+            ],
+            "description": "assigned = a real agent owns it, contact them. pending = routing has not finished, ask again after retryAfterSeconds and tell the customer nothing yet. unassigned = routing ran and nobody took it; FINAL, send the generic reply and notify no one. pool = deliberately ownerless in a shared pool until an agent claims it; also a generic reply. unassigned and pool together account for roughly 30% of leads — they are not errors."
+          },
+          "agent": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Agent"
+              }
+            ],
+            "nullable": true,
+            "description": "Populated only when `status` is `assigned`."
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the lead was created."
+          },
+          "retryAfterSeconds": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Seconds to wait before asking again. Non-null only when `status` is `pending`."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ResponseTimeRequest": {
+        "type": "object",
+        "required": [
+          "seconds"
+        ],
+        "properties": {
+          "seconds": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2592000,
+            "example": 47,
+            "description": "How long the assigned agent took to respond, in whole seconds from the customer's first contact. Capped at 30 days."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ResponseTimeResult": {
+        "type": "object",
+        "required": [
+          "leadId",
+          "agentResponseSeconds",
+          "agentRespondedAt"
+        ],
+        "properties": {
+          "leadId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "agentResponseSeconds": {
+            "type": "integer"
+          },
+          "agentRespondedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Set by Provident at the moment of the call, not by you. Distinguishes a genuine response time from a backfill."
+          }
+        },
+        "additionalProperties": false
+      },
+      "WebhookLead": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "url": {
+            "type": "string",
+            "nullable": true,
+            "description": "Deep link to the lead in the Provident CRM.",
+            "example": "https://portal.prov.ae/en/crm/leads/a1b2c3d4-5566-7788-99aa-bbccddeeff00"
+          },
+          "pageUrl": {
+            "type": "string",
+            "nullable": true,
+            "description": "The PUBLIC page the enquiry came from — the listing or project page the customer was looking at. This is the link to give an agent; `url` above is the staff-only CRM record. Null for leads with no public page (Meta lead-ads, leads created inside the CRM).",
+            "example": "https://providentestate.com/new-projects/the-w-arada-developments-dubai-harbour/"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "stage": {
+            "type": "string",
+            "nullable": true
+          },
+          "source": {
+            "type": "string",
+            "nullable": true
+          },
+          "leadType": {
+            "type": "string",
+            "nullable": true
+          },
+          "campaign": {
+            "type": "string",
+            "nullable": true
+          },
+          "initialInquiry": {
+            "type": "string",
+            "nullable": true
+          },
+          "listing": {
+            "type": "object",
+            "nullable": true,
+            "properties": {
+              "id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "referenceNo": {
+                "type": "string",
+                "nullable": true,
+                "example": "PS-24082614"
+              },
+              "title": {
+                "type": "string",
+                "nullable": true
+              }
+            }
+          }
+        }
+      },
+      "WebhookCustomer": {
+        "type": "object",
+        "properties": {
+          "fullName": {
+            "type": "string",
+            "nullable": true
+          },
+          "firstName": {
+            "type": "string",
+            "nullable": true
+          },
+          "lastName": {
+            "type": "string",
+            "nullable": true
+          },
+          "phones": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "emails": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "WebhookProperty": {
+        "type": "object",
+        "description": "Everything here is a DISPLAY NAME, not an id — meant to go straight into a message a person reads.",
+        "properties": {
+          "developer": {
+            "type": "string",
+            "nullable": true,
+            "example": "Emaar Properties"
+          },
+          "community": {
+            "type": "string",
+            "nullable": true,
+            "description": "Null for some leads — the location tree is uneven. Fall back to `location` / `locationPath` rather than leaving a hole in a sentence.",
+            "example": "Dubai Hills Estate"
+          },
+          "location": {
+            "type": "string",
+            "nullable": true,
+            "description": "The lead's own location, often a tower or sub-community.",
+            "example": "Collective"
+          },
+          "locationPath": {
+            "type": "string",
+            "nullable": true,
+            "description": "The whole chain, root first.",
+            "example": "Dubai, Dubai Hills Estate, Collective"
+          },
+          "project": {
+            "type": "string",
+            "nullable": true
+          },
+          "propertyType": {
+            "type": "string",
+            "nullable": true,
+            "example": "Apartment"
+          },
+          "bedrooms": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "LeadCreatedWebhook": {
+        "type": "object",
+        "description": "A lead was created in the CRM, from any channel. Fires whether or not it has an owner yet — WILL include leads you submitted, unless you ask Provident to exclude your API client.",
+        "properties": {
+          "event": {
+            "type": "string"
+          },
+          "deliveryId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Stable across retries. Deduplicate on this — delivery is at-least-once, not exactly-once."
+          },
+          "occurredAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the body was built. Order is NOT guaranteed; compare this rather than arrival time."
+          },
+          "lead": {
+            "$ref": "#/components/schemas/WebhookLead"
+          },
+          "customer": {
+            "$ref": "#/components/schemas/WebhookCustomer"
+          },
+          "property": {
+            "$ref": "#/components/schemas/WebhookProperty"
+          },
+          "agent": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Agent"
+              }
+            ],
+            "nullable": true,
+            "description": "Often null: this fires at creation, usually before routing has chosen anyone. Wait for lead.assigned."
+          },
+          "intake": {
+            "type": "object",
+            "properties": {
+              "clientId": {
+                "type": "string",
+                "nullable": true,
+                "description": "The API client that submitted the lead. Yours, if you sent it."
+              },
+              "clientName": {
+                "type": "string",
+                "nullable": true
+              },
+              "integrationRef": {
+                "type": "string",
+                "nullable": true,
+                "description": "Whatever you sent as integrationRef."
+              }
+            }
+          }
+        }
+      },
+      "LeadAssignedWebhook": {
+        "type": "object",
+        "description": "A lead's owner became a real, active agent. NOTHING is sent when a lead ends up with no owner — that is a state, not an event; ask GET /public/leads/{id}/assignment for it.",
+        "properties": {
+          "event": {
+            "type": "string"
+          },
+          "deliveryId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Stable across retries. Deduplicate on this — delivery is at-least-once, not exactly-once."
+          },
+          "occurredAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the body was built. Order is NOT guaranteed; compare this rather than arrival time."
+          },
+          "lead": {
+            "$ref": "#/components/schemas/WebhookLead"
+          },
+          "customer": {
+            "$ref": "#/components/schemas/WebhookCustomer"
+          },
+          "property": {
+            "$ref": "#/components/schemas/WebhookProperty"
+          },
+          "agent": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Agent"
+              }
+            ],
+            "description": "Always populated on this event."
+          },
+          "trigger": {
+            "type": "string",
+            "enum": [
+              "created",
+              "routed",
+              "reassigned",
+              "merged"
+            ],
+            "description": "created = the lead had an owner from the moment it was created (a listing agent, or an explicit assignedBy). routed = the routing engine placed a lead that had no owner. reassigned = the lead moved from one agent to another. merged = a repeat enquiry was folded into a lead that already has an owner — a SECOND customer message on a lead whose agent you may already have notified."
+          },
+          "previousAgentId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          }
+        }
+      },
+      "UpdateLeadRequest": {
+        "type": "object",
+        "description": "Fields to change on an existing lead. Same names, lookups and forgiving matching as CreateLeadRequest; everything is optional, including phone and email — an update carrying nothing but a `quiz` block is normal. Omit a field and it is left alone. Send an explicit `null` and the column is cleared. Send a value that matches no CRM record and the column keeps what it had, with the value reported in `intakeUnresolved`. `leadPhones` and `leadEmails` are APPENDED to the lead, never replacing what is there. Quiz answers supersede the previous answers for the same `quizKey` only. `assignedBy`, `funnel` and `distributionType` are create-only and absent here: an external system does not move a lead between agents, between funnel boards, or onto a different aging clock.",
+        "properties": {
+          "leadPhones": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "description": "Phone numbers. Used FIRST to match an existing contact. Use E.164 format for reliable matching. Required unless `leadEmails` is supplied.",
+            "example": [
+              "+971501234567"
+            ]
+          },
+          "leadEmails": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 255
+            },
+            "description": "Email addresses. Used to match an existing contact when no phone matches. Required unless `leadPhones` is supplied.",
+            "example": [
+              "john.doe@example.com"
+            ]
+          },
+          "leadFirstName": {
+            "type": "string",
+            "maxLength": 255,
+            "nullable": true,
+            "example": "John"
+          },
+          "leadMiddleName": {
+            "type": "string",
+            "maxLength": 255,
+            "nullable": true,
+            "example": "Ahmad"
+          },
+          "leadSecondName": {
+            "type": "string",
+            "maxLength": 255,
+            "nullable": true,
+            "description": "Second given name — used when no middle name is supplied.",
+            "example": "A."
+          },
+          "leadLastName": {
+            "type": "string",
+            "maxLength": 255,
+            "nullable": true,
+            "example": "Doe"
+          },
+          "leadCompanyName": {
+            "type": "string",
+            "maxLength": 255,
+            "nullable": true,
+            "description": "Company name for corporate enquiries.",
+            "example": "Acme Real Estate"
+          },
+          "leadType": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Lead type display name, e.g. `Primary Buyer`, `Secondary Buyer`, `Primary Buyer and Secondary Buyer`, `Tenant`, `Landlord`, `Broker`, `Seller`, `Owner`, `Mortgages`. Ask Provident for the full list. The shorthand `Primary` / `Secondary` / `Primary and Secondary` is accepted as an alias for the corresponding `… Buyer` type, in either direction. Omit this on a listing enquiry and it is derived from the listing — see `listingId`.",
+            "example": "Primary Buyer"
+          },
+          "priority": {
+            "type": "string",
+            "maxLength": 64,
+            "nullable": true,
+            "description": "Free text priority indicator.",
+            "example": "High"
+          },
+          "marketSegment": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Marketing's segmentation of the lead.",
+            "enum": [
+              "Standard",
+              "Luxury",
+              "Super Luxury"
+            ],
+            "example": "Luxury"
+          },
+          "agentCategory": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Marketing's grading of the lead.",
+            "enum": [
+              "A",
+              "B",
+              "C",
+              "D"
+            ],
+            "example": "A"
+          },
+          "areaOfInterest": {
+            "type": "string",
+            "nullable": true,
+            "description": "LOOKUP. Location the lead is interested in.",
+            "example": "Dubai Marina"
+          },
+          "propertyTypeInterest": {
+            "type": "string",
+            "maxLength": 255,
+            "nullable": true,
+            "description": "LOOKUP. Property type the lead is interested in. Matched case-insensitively after trimming, and a regular English plural also matches the singular catalogue entry (`Apartments` → `Apartment`, `Townhouses` → `Townhouse`), so a form offering plural choices needs no mapping on your side.",
+            "example": "Apartment"
+          },
+          "budgetMin": {
+            "type": "string",
+            "nullable": true,
+            "description": "Minimum budget. Numeric string; a JSON number is also accepted.",
+            "example": "1000000"
+          },
+          "budgetMax": {
+            "type": "string",
+            "nullable": true,
+            "description": "Maximum budget. Numeric string; a JSON number is also accepted.",
+            "example": "2500000"
+          },
+          "currency": {
+            "type": "string",
+            "maxLength": 3,
+            "description": "LOOKUP. ISO 4217 currency code for the budget values.",
+            "example": "AED"
+          },
+          "initialInquiry": {
+            "type": "string",
+            "nullable": true,
+            "description": "Free-text message or callback reason from the form.",
+            "example": "Looking for a 2BR with sea view, ready to move in Q4."
+          },
+          "languages": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 255
+            },
+            "description": "LOOKUP. Languages the lead speaks, by code or name. Unrecognised entries are ignored.",
+            "example": [
+              "ar",
+              "English"
+            ]
+          },
+          "listingId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "LOOKUP. Provident listing UUID. Takes precedence over `referenceNo` when both are sent.\n\nA resolved listing also fills in what the form did not ask. Each field below is taken from the listing ONLY where this payload leaves it empty — anything you send always wins, and a quiz answer mapped to the same field beats the listing too:\n- `leadType` — from the listing category and offering type: Primary -> Primary Buyer, Secondary -> Secondary Buyer, and any rental listing -> Tenant whatever its category.\n- developer, location, property type, bedrooms, currency — copied from the listing. The location fills the lead's own location and does not overwrite `areaOfInterest`.\n- `budgetMin` — the listing price, unless the price is on application or it would exceed a `budgetMax` you sent. `budgetMax` is never derived.\n\nSending a value we then fail to match (an unknown developer name, say) is still reported in `intakeUnresolved` even though the listing goes on to fill that field.\n\nThe listing's own agent, where it has one, becomes the lead owner and wins over `assignedBy`."
+          },
+          "referenceNo": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "LOOKUP. Listing reference number, used when `listingId` is not supplied. A reference number matching MORE THAN ONE listing counts as unresolved, and nothing is inherited. See `listingId` for what a resolved listing fills in.",
+            "example": "PR-123456"
+          },
+          "source": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Lead source. Send this — an unrecognised or omitted source leaves the lead with no source attribution.",
+            "example": "Website"
+          },
+          "subSource": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 255
+            },
+            "description": "LOOKUP. Sub-sources. Only those linked to the resolved `source` are kept; ignored entirely when `source` did not resolve.",
+            "example": [
+              "Callback Form",
+              "Team Page"
+            ]
+          },
+          "marketingType": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Marketing type, e.g. Organic or Paid.",
+            "example": "Organic"
+          },
+          "eventType": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. What the user did — e.g. Submit Form, Call, Whatsapp Click, DM, Webpush, Gamification.",
+            "example": "Submit Form"
+          },
+          "campaignName": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. CRM campaign name.",
+            "example": "Spring 2026 Landing Page"
+          },
+          "advertisingCampaign": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "CREATED ON FIRST SIGHT. Advertising campaign name — the one field here that is not a strict lookup: a name Provident has never seen creates the campaign instead of being discarded. Omit it when you send `metaFacebook`; the Meta campaign fills it.",
+            "example": "Google Ads — Q3"
+          },
+          "developerName": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Developer the enquiry is about, matched on name or slug — `Sobha Realty` or `sobha-realty`. Values come from `GET /public/developers`.",
+            "example": "Sobha Realty"
+          },
+          "developerId": {
+            "type": "string",
+            "description": "Developer uuid from `GET /public/developers`. Takes precedence over `developerName`; a non-uuid value here is treated as a name instead of being discarded.",
+            "example": "8ecf4fcd-ec63-5764-8524-7cd917494dbe"
+          },
+          "website": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Website NAME or DOMAIN the lead came from — either resolves, matched case-insensitively. Prefer the domain (`provident.ae`, `providentestate.com`); it survives a display-name change. Ask Provident to add your domain before you start sending it.",
+            "example": "provident.ae"
+          },
+          "pageUrl": {
+            "type": "string",
+            "nullable": true,
+            "description": "Full URL of the page the submission originated from.",
+            "example": "https://prov.ae/en/dubai-marina?utm_source=google"
+          },
+          "pathLocale": {
+            "type": "string",
+            "maxLength": 32,
+            "nullable": true,
+            "description": "Locale segment of the URL path, e.g. `en`.",
+            "example": "en"
+          },
+          "gclid": {
+            "type": "string",
+            "maxLength": 512,
+            "nullable": true,
+            "description": "Google Ads click id."
+          },
+          "fbclid": {
+            "type": "string",
+            "maxLength": 512,
+            "nullable": true,
+            "description": "Facebook click id."
+          },
+          "utmSource": {
+            "type": "string",
+            "maxLength": 512,
+            "nullable": true,
+            "example": "google"
+          },
+          "utmMedium": {
+            "type": "string",
+            "maxLength": 512,
+            "nullable": true,
+            "example": "cpc"
+          },
+          "utmCampaign": {
+            "type": "string",
+            "maxLength": 512,
+            "nullable": true,
+            "example": "spring-2026"
+          },
+          "utmTerm": {
+            "type": "string",
+            "maxLength": 512,
+            "nullable": true,
+            "example": "dubai marina apartments"
+          },
+          "utmContent": {
+            "type": "string",
+            "maxLength": 512,
+            "nullable": true,
+            "example": "hero-cta"
+          },
+          "formName": {
+            "type": "string",
+            "maxLength": 255,
+            "nullable": true,
+            "description": "Name of the web form the visitor submitted. Falls back to `metaFacebook.formName` (truncated to 255) when omitted.",
+            "example": "contact-popup-form"
+          },
+          "adsetName": {
+            "type": "string",
+            "maxLength": 255,
+            "nullable": true,
+            "description": "Ad set / ad group name on your side. Free text — distinct from the `campaignName` lookup. Falls back to `metaFacebook.adgroupName` (truncated to 255) when omitted.",
+            "example": "test ww"
+          },
+          "referrer": {
+            "type": "string",
+            "nullable": true,
+            "description": "Referring URL the visitor arrived from.",
+            "example": "https://sobha-city.provident.ae/?utm_source=Google+Ads"
+          },
+          "ipAddress": {
+            "type": "string",
+            "maxLength": 64,
+            "nullable": true,
+            "description": "Submitter IP. IPv4, IPv6 and proxy chains all fit.",
+            "example": "217.165.113.16"
+          },
+          "userAgent": {
+            "type": "string",
+            "nullable": true,
+            "description": "Browser user-agent string captured at submission.",
+            "example": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+          },
+          "submittedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "description": "When the visitor submitted the form on your side. Distinct from the CRM's own createdAt, which is when we received it. An unparseable value is ignored rather than failing the request.",
+            "example": "2026-07-27T13:45:31.728Z"
+          },
+          "localeCountry": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "LOOKUP. Country code (e.g. AE) or full country name. When omitted, the API attempts to infer it from a trailing two-letter segment of `pageUrl`.",
+            "example": "AE"
+          },
+          "metaFacebook": {
+            "$ref": "#/components/schemas/MetaFacebookPayload"
+          },
+          "quiz": {
+            "$ref": "#/components/schemas/QuizSubmission"
+          },
+          "integrationRef": {
+            "type": "string",
+            "maxLength": 128,
+            "nullable": true,
+            "description": "Your handle for the specific automation behind this lead — a Make scenario name, a webhook id, a form build. Free text: stored verbatim, never matched against anything, and never reported in `intakeUnresolved`.\n\nIt identifies an INTEGRATION, not a submission, so keep it stable across every lead that automation sends; a per-lead unique id makes it useless for grouping. Values are only distinguished within one sender, so two partners can both use `scenario-1`.\n\nDo NOT put your own name here. The submitting OAuth client is recorded automatically from the access token — there is no field for it, because attribution a sender can write is not attribution.",
+            "example": "make:meta-leadgen-eu"
+          }
+        },
+        "additionalProperties": true
+      },
+      "UpdatedLead": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "updated": {
+            "type": "boolean",
+            "description": "False when the submission changed nothing — every value sent was already the lead's. Not an error."
+          },
+          "updatedFields": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Lead columns this submission actually changed, by CRM name (`closingAreaId` is what `areaOfInterest` fills). `leadPhones`/`leadEmails` appear when a new one was added, `quizAnswers` when answers were written, `metaFacebook` when the Meta block was stored.",
+            "example": [
+              "budgetMin",
+              "budgetMax",
+              "closingAreaId",
+              "quizAnswers"
+            ]
+          },
+          "intakeUnresolved": {
+            "type": "object",
+            "nullable": true,
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Values sent on THIS submission that matched no CRM record, keyed by the field you sent. Merged with whatever was already unresolved on the lead — an update never clears a flag it did not answer."
+          },
+          "needsIntakeReview": {
+            "type": "boolean",
+            "description": "True when intakeUnresolved is non-empty."
+          },
+          "rerouted": {
+            "type": "boolean",
+            "description": "True when the new details sent the lead back through the assignment engine. Only ever true for a lead nobody held — an update never moves a lead away from the agent working it. Routing is asynchronous: poll GET /public/leads/{id}/assignment for the outcome."
+          },
+          "assignedTo": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Agent"
+              }
+            ],
+            "nullable": true,
+            "description": "The agent holding the lead as this response was written, or null."
+          }
+        }
+      }
+    }
+  },
+  "x-webhooks": {
+    "lead.created": {
+      "post": {
+        "tags": [
+          "Webhooks"
+        ],
+        "summary": "Provident → you: a lead was created",
+        "description": "Sent to the URL you supply. Verify `X-Provident-Webhook-Secret` in constant time and reject anything else with 401.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LeadCreatedWebhook"
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Acknowledged. Answer within 10 seconds, BEFORE doing any work."
+          },
+          "4XX": {
+            "description": "Permanent — never retried, except 408 and 429. Do not use for a temporary problem."
+          },
+          "5XX": {
+            "description": "Retried at 30s, 1m, 5m, 10m, 15m, 30m, then given up on."
+          }
+        }
+      }
+    },
+    "lead.assigned": {
+      "post": {
+        "tags": [
+          "Webhooks"
+        ],
+        "summary": "Provident → you: a lead was assigned to an agent",
+        "description": "Sent on every owner change to a real, active agent, including reassignments and merged enquiries. Replaces polling GET /public/leads/{id}/assignment.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LeadAssignedWebhook"
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Acknowledged. Answer within 10 seconds, BEFORE doing any work."
+          },
+          "4XX": {
+            "description": "Permanent — never retried, except 408 and 429."
+          },
+          "5XX": {
+            "description": "Retried at 30s, 1m, 5m, 10m, 15m, 30m, then given up on."
+          }
+        }
+      }
+    }
+  }
+}

@@ -7,6 +7,39 @@
 > `docs/PUBLIC_LEADS_ENDPOINT.md` and `public-lead-full-example.md`, were folded into
 > this document and deleted on 2026-07-31; nothing else describes this endpoint.)
 
+> **Changed 2026-09-06 — read this if you are already integrated.**
+> 1. New **`PUT /v2/public/leads/{id}`** (§9) — send details you did not have when you
+>    created the lead, most obviously quiz answers the customer finished afterwards. Send
+>    only what changed; phones and emails are **added**, never replaced; the lead's stage,
+>    status, owner and funnel stay Provident's.
+> 2. Sections 9–16 of the previous revision are now 10–17.
+>
+> **Changed 2026-08-24 — read this if you are already integrated.**
+> 1. Every `201` from `POST /v2/public/leads` — **including a merged one** — now carries
+>    **`assignedTo`**: the agent the lead landed on, with the phone and email to reach
+>    them (§8). Merged responses previously had only three fields.
+> 2. New **`GET /v2/public/leads/{id}/assignment`** (§10) tells you who a lead ended up
+>    with, and crucially distinguishes *"routing hasn't finished"* from *"nobody took
+>    it"*. Read it before assuming an ownerless lead is a failure.
+> 3. New **`POST /v2/public/leads/{id}/response-time`** (§11) records how long the agent
+>    took to respond.
+> 4. Provident can now **call you** when a lead is created or assigned — see
+>    **§12, webhooks**. If you take the webhooks you do not need to poll §10 at all.
+>
+> **Changed 2026-08-19 — read this if you are already integrated.**
+> 1. A second enquiry from the same phone/email inside ~24h is now **merged** into the
+>    existing lead instead of creating a new one, and that response has a **different,
+>    much shorter body**. Branch on `merged` (§7, §8).
+> 2. A lead that names a listing now **inherits** that listing's lead type, developer,
+>    location, property type, bedrooms, currency and price — into fields you left empty
+>    (§4.4).
+> 3. `GET /v2/public/developers` moved from `page` to `limit`/`offset`; `page` is now
+>    **rejected with `422`**, not ignored (§14.2).
+> 4. There is now a standalone locations endpoint (§14.1).
+> 5. New optional field `integrationRef` — tag each lead with the integration that
+>    produced it (§4.6.1). Worth sending from day one; it is what lets Provident answer
+>    "which of your automations sent this" without guessing.
+
 Server-to-server API for pushing leads into the Provident CRM.
 
 Two endpoints are involved:
@@ -15,6 +48,12 @@ Two endpoints are involved:
 |---|---------|---------------|
 | 1 | Get an access token | `POST /v2/oauth2/token` |
 | 2 | Create a lead | `POST /v2/public/leads` |
+| 3 | Add details you did not have at first | `PUT /v2/public/leads/{id}` |
+| 4 | Find out who the lead was assigned to | `GET /v2/public/leads/{id}/assignment` |
+| 5 | Record the agent's response time | `POST /v2/public/leads/{id}/response-time` |
+
+Provident can also **call your server** when a lead is created or assigned, which
+replaces polling #4 entirely — see §12.
 
 Authentication is **OAuth 2.0 Client Credentials**. There is no user login, no
 redirect, no consent screen — your server exchanges a client id + secret for a
@@ -338,17 +377,54 @@ Legend for **Match**:
 
 | Field | Type | Max | Match | Notes |
 |-------|------|-----|-------|-------|
-| `leadType` | `string` | 255 | lookup | Display name of the lead type: `Primary`, `Secondary`, `Primary and Secondary`, `Broker`, `Seller`, `Tenant`, `Landlord`, `Owner`, `Mortgages`, … Ask Provident for the current list. The legacy wording `Primary Buyer` / `Secondary Buyer` / `Primary Buyer and Secondary` is accepted and mapped onto the first three, so senders built against the old CRM keep working. |
+| `leadType` | `string` | 255 | lookup | Display name of the lead type: `Primary Buyer`, `Secondary Buyer`, `Primary Buyer and Secondary Buyer`, `Tenant`, `Landlord`, `Broker`, `Seller`, `Owner`, `Mortgages`, … Ask Provident for the current list. The shorthand `Primary` / `Secondary` / `Primary and Secondary` is accepted as an alias for the corresponding `… Buyer` type, in either direction. **Omit this on a listing enquiry** — it is then derived from the listing, correctly (§4.4). |
+| `funnel` | `string` | 255 | lookup | Which CRM funnel the enquiry belongs to. **Omit it for the main sales pipeline** — see below. |
 | `priority` | `string` | 64 | exact | Free text, e.g. `"High"`. |
 | `marketSegment` | `string` | 255 | lookup | Marketing's segmentation: `Standard`, `Luxury`, `Super Luxury`. |
 | `agentCategory` | `string` | 255 | lookup | Marketing's grading of the lead: `A`, `B`, `C`, `D`. |
+
+#### `funnel` — which pipeline the lead lands in
+
+Provident runs several pipelines beside the main sales one. **Leave `funnel` out and the lead
+goes to the main sales pipeline**, which is what almost every enquiry wants and what every lead
+posted to this API did before the field existed. Send a value only when the enquiry belongs to a
+different business line:
+
+| `funnel` | also accepted as |
+|---|---|
+| `Leasing` | `leasing` |
+| `Show Room` | `show_room` |
+| `PvH` | `pvh` |
+| `Mortgages` | `mortgages` |
+| `Property Management` | `property_management` |
+| `Landlord/Sellers Listings` | `landlord_sellers_listings` |
+| `Provident the Agency` | `provident_the_agency` |
+| `Events` | `events` |
+| `Recruitment` | `recruitment` |
+| `Precision Inspections` | `precision_inspections` |
+| `811 services` | `811_services` |
+| `Prism` | `prism` |
+
+Matched case-insensitively, ignoring spaces, hyphens and underscores — so `Show Room`,
+`show_room` and `showroom` are the same funnel. The lead lands on that funnel's own first stage,
+which is not always called the same thing (`New Registration` on Show Room,
+`New Seller - Landlord` on Landlord/Sellers Listings).
+
+**`funnel` is not derived from `leadType`, deliberately.** The two do not line up: a `Tenant`
+enquiry may belong to Leasing or to PvH, and a `Primary Buyer` to sales, Show Room or Provident
+the Agency. Only you know which business line the enquiry came from, so only you can say.
+
+**An unrecognised funnel never fails the request.** The lead is created on the main sales
+pipeline and the value you sent comes back in `intakeUnresolved.funnel`. Watch for that — a
+typo (`"Leasng"`) is indistinguishable from omitting the field in every other respect, so the
+only symptom is a funnel team quietly receiving nothing.
 
 ### 4.3 Requirement / interest
 
 | Field | Type | Max | Match | Notes |
 |-------|------|-----|-------|-------|
 | `areaOfInterest` | `string` | — | lookup | Location name, e.g. `"Dubai Marina"`. |
-| `propertyTypeInterest` | `string` | 255 | lookup | e.g. `"Apartment"`, `"Villa"`. |
+| `propertyTypeInterest` | `string` | 255 | lookup | e.g. `"Apartment"`, `"Villa"`. A regular English plural also matches the singular entry (`"Apartments"` → `Apartment`), so a form offering plural choices needs no mapping on your side. |
 | `budgetMin` | `string` \| `number` | — | exact | Numeric; a JSON number is also accepted. |
 | `budgetMax` | `string` \| `number` | — | exact | Numeric; a JSON number is also accepted. |
 | `currency` | `string` | 3 | lookup | ISO 4217 code — `AED`, `USD`, … |
@@ -360,10 +436,32 @@ Legend for **Match**:
 | Field | Type | Max | Match | Notes |
 |-------|------|-----|-------|-------|
 | `listingId` | `string` (uuid) | — | lookup | Provident listing UUID. **Takes precedence** if both are sent. |
-| `referenceNo` | `string` | 128 | lookup | Listing reference number, e.g. `"PR-123456"`. |
+| `referenceNo` | `string` | 128 | lookup | Listing reference number, e.g. `"PR-123456"`. A reference number that matches **more than one** listing counts as unresolved, and nothing below is inherited. |
 
-Linking a listing also makes the lead inherit that listing's agent as its owner
-where one is set.
+**A resolved listing fills in what your form did not ask.** Every field in this table is
+taken from the listing **only where your payload left it empty** — anything you send
+always wins, and a quiz answer (§4.9) mapped to the same field beats the listing too.
+
+| Lead field | Taken from the listing |
+|------------|------------------------|
+| `leadType` (§4.2) | Derived from the listing's category **and** offering type: Primary → `Primary Buyer`, Secondary → `Secondary Buyer`, and **any rental listing → `Tenant`** whatever its category. |
+| `developerName` / `developerId` | The listing's developer. |
+| Location | The listing's own area. This fills the lead's location; it does **not** overwrite `areaOfInterest`, which stays what the enquirer told you. |
+| `propertyTypeInterest` | The listing's property type. |
+| Bedrooms | The listing's bedroom value (`"Studio"`, `"1"` … `"10+"`). |
+| `currency` | The listing's currency. |
+| `budgetMin` | The listing price — **unless** the price is on application, or it would exceed a `budgetMax` you sent. `budgetMax` is never derived. |
+
+This matters beyond convenience: lead type, developer and location are all inputs to
+Provident's routing, so a lead that names a listing is routed on what it actually is
+instead of falling through to a catch-all.
+
+Sending a value we then fail to match (an unknown developer name, say) is **still**
+reported in `intakeUnresolved` (§5) even though the listing goes on to fill that field —
+the mismatch stays visible so it can be corrected on your side.
+
+Linking a listing also makes the lead inherit that listing's agent as its owner where one
+is set; that agent wins over `assignedBy` (§4.7).
 
 ### 4.5 Source & attribution
 
@@ -372,9 +470,9 @@ where one is set.
 | `source` | `string` | 255 | lookup | Lead source, e.g. `"Website"`. **Send this** — an unrecognised or missing source leaves the lead with no source. |
 | `subSource` | `string[]` | 255 per entry | lookup | Sub-sources, e.g. `["Callback Form"]`. Only kept when they belong to the resolved `source`; ignored entirely if `source` did not match. |
 | `marketingType` | `string` | 255 | lookup | e.g. `"Organic"`, `"Paid"`. |
-| `eventType` | `string` | 255 | lookup | What the user did: `Submit Form`, `Call`, `Whatsapp Click`, `DM`, `Webpush`, `Gamification`. |
+| `eventType` | `string` | 255 | lookup | What the user did: `Submit Form`, `Call`, `Whatsapp Click`, `DM`, `Webpush`, `Pop Ups`, `Gamification`. |
 | `campaignName` | `string` | 255 | lookup | CRM campaign name. |
-| `advertisingCampaign` | `string` | 255 | lookup | Advertising campaign name. |
+| `advertisingCampaign` | `string` | 255 | **created on first sight** | Advertising campaign name. The one field on this endpoint that is *not* a strict lookup: a name Provident has never seen creates the campaign rather than being discarded. Omit it if you send `metaFacebook` — the Meta campaign fills it (§4.8). |
 | `developerName` | `string` | 255 | lookup | Developer the enquiry is about — name or slug, e.g. `"Sobha Realty"` / `"sobha-realty"`. Values come from [`GET /v2/public/developers`](#102-developers). |
 | `developerId` | `string` (uuid) | — | lookup | Developer UUID from the same endpoint. **Takes precedence** over `developerName`; a non-UUID value here is treated as a name rather than discarded. |
 | `website` | `string` | 255 | lookup | Website **name or domain** — either resolves. Prefer the domain (`"provident.ae"`, `"providentestate.com"`): it survives a display-name change. Your domain must exist in the CRM first — **tell Provident which domains you post from before you go live**, otherwise every lead arrives with no website. |
@@ -405,16 +503,100 @@ Stored verbatim on the lead — no lookup, nothing here can end up in `intakeUnr
 | `referrer` | `string` | — | exact | Referring URL the visitor arrived from. |
 | `ipAddress` | `string` | 64 | exact | Submitter IP. IPv4, IPv6 and proxy chains all fit. |
 | `userAgent` | `string` | — | exact | Browser user-agent captured at submission. |
+| `integrationRef` | `string` | 128 | exact | **Your handle for the specific automation behind this lead** — a Make scenario name, a webhook id, a form build. Free text, kept exactly as sent. See below. |
 | `submittedAt` | `string` (ISO-8601) | — | exact | When the visitor submitted on **your** side. Distinct from the CRM's own `createdAt`, which is when we received it. An unparseable value is ignored rather than failing the request. |
 
 > Top-level `formName` is your web form. It is unrelated to `metaFacebook.formName`
 > (§4.8), which is the Meta lead-form name — send both when both apply.
+>
+> **If you send neither, the Meta block fills them.** A lead with no top-level
+> `formName` / `adsetName` takes `metaFacebook.formName` and
+> `metaFacebook.adgroupName` instead (truncated to 255). So a scenario that just
+> forwards Meta verbatim no longer produces leads with an empty ad set — which
+> is the column these are reported on. Anything you send at the top level wins.
+
+**About `integrationRef`.** Most senders run more than one thing against this API — several
+Make scenarios, a website form and a chatbot, one automation per campaign. When a batch of
+leads turns out to be junk, or a field stops mapping, the first question is always *which
+one produced these*, and nothing else in the payload answers it: `formName` is the visitor's
+form, `source` is marketing attribution, and both are frequently identical across your whole
+estate.
+
+- **Keep it stable.** It identifies an integration, not a submission — the same scenario
+  sends the same value every time. A per-lead unique id makes it useless for grouping.
+- **Make it specific**, e.g. `make:meta-leadgen-eu`, `wp-contact-form-7`, `chatbot-v2`.
+- **It is never validated**: nothing to match, so it can never appear in `intakeUnresolved`
+  (§5) and can never cost you a lead. An unknown value is simply a new value.
+- **Don't put your own name in it.** Who you are is recorded automatically and separately,
+  from your access token — see below. Values are only distinguished *within* one sender, so
+  two partners can both use `scenario-1` without colliding.
+
+> **You are identified automatically.** Every lead records the OAuth client it was submitted
+> with, resolved server-side from your token. There is no field for it and no way to send
+> one — attribution a sender can write is not attribution. This is also why a client id and
+> secret must never be shared between two integrations that you would want to tell apart:
+> use `integrationRef` for that, or ask Provident for a second client.
 
 ### 4.7 Assignment (optional)
 
 | Field | Type | Max | Match | Notes |
 |-------|------|-----|-------|-------|
 | `assignedBy` | `string` | 255 | lookup | Assign the lead to a specific Provident agent — **send the agent's email address**. If omitted (or unmatched), Provident's automatic assignment engine routes the lead. Leave it out unless you have been told to use it. |
+| `distributionType` | `string` | 64 | lookup | How you would like the lead routed. **A hint, not an instruction** — see below. Leave it out unless you have been told to use it. |
+
+> When the lead also resolves a listing (§4.4) and that listing has an agent of its own,
+> **the listing's agent wins** — `assignedBy` is used only when the listing has none.
+
+#### `distributionType` — a routing hint
+
+`distributionType` records **how you would like the lead routed**. It is stored on the lead and
+only changes who receives it if Provident has configured a routing rule that reads it. By
+default no rule does, so sending one is safe and changes nothing — it is a label you can send
+today and Provident can act on later, without you changing anything.
+
+Accepted values, matched case-insensitively after trimming (the leading word on its own also
+works, so `campaign` is the same as `Campaign distribution`):
+
+| value | short form |
+|---|---|
+| `Personal distribution` | `personal` |
+| `Campaign distribution` | `campaign` |
+| `Developer distribution` | `developer` |
+| `Language distribution` | `language` |
+| `Default distribution` | `default` |
+| `Developer and Area distribution` | — |
+| `Area distribution Secondary` | — |
+| `Roadshow distribution` | `roadshow` |
+
+**An unrecognised value is stored exactly as you sent it rather than rejected.** A lead is never
+lost over this field — it simply matches no rule. That also means a typo fails silently, so
+check the value if you expect routing to depend on it.
+
+**`Personal distribution` is the one value with behaviour attached today.** It marks the lead as
+having a named owner, and a lead marked that way is never re-assigned automatically — it will
+not be taken off its owner by the system for going untouched, and no follow-up clock runs
+against it at all.
+
+**It only takes effect together with a resolved `assignedBy`.** The two fields are one
+instruction: `assignedBy` names the owner, `Personal distribution` says the owner keeps the
+lead. If `assignedBy` is missing, or is an address we cannot match to a current Provident agent,
+the lead is still created and routed normally — but the `Personal distribution` marker is
+dropped rather than applied, because a lead exempted from follow-up with nobody on it is a lead
+nothing chases. When that happens the value you sent comes back in `intakeUnresolved` under
+`distributionType`, alongside `assignedBy`, so the mismatch is visible in the response:
+
+```json
+"intakeUnresolved": {
+  "assignedBy": "ex.agent@providentestate.com",
+  "distributionType": "Personal distribution"
+}
+```
+
+**If you leave `distributionType` out, a Meta lead form can carry it instead.** A
+`Distribution` or `Distribution Type` entry in `metaFacebook.customFields` (§4.8) is read as a
+fallback and normalised through the same table above. That is there because the value is
+usually set by whoever built the ad form, not by whoever posts the lead — so you do not have to
+lift it out of the custom fields yourself. A top-level `distributionType` always wins.
 
 ### 4.8 `metaFacebook` — Meta / Facebook / Instagram lead ads
 
@@ -422,11 +604,27 @@ Send this object **only** when the lead came from a Meta (or TikTok) lead form.
 The standard fields above still drive routing; this block preserves the ad-platform
 metadata alongside the lead.
 
+**It is no longer only stored.** Five of these fields are copied onto the lead itself,
+where they are searchable, filterable and reportable next to every other lead column:
+
+| You send | Lands on the lead as |
+|----------|----------------------|
+| `metaCampaignId` + `metaCampaignName` | the lead's **advertising campaign** — matched on the Meta campaign id, and **created if Provident has never seen it**, so you do not have to agree campaign names in advance |
+| `finalPageName` | the page the ad ran under |
+| `adName` / `adId` | the ad |
+| `adgroupName` / `adgroupId` | the ad set (also fills `adsetName`, §4.6.1) |
+| `formName` / `formId` | the lead form (also fills `formName`, §4.6.1) |
+
+Matching on the **id** is what makes a rename safe: rename a campaign in Ads Manager and
+its leads stay on the one campaign in the CRM, under the name it was first seen with.
+`campaignName` (§4.5) is a different thing and is still a strict lookup — it is the CRM's
+own campaign, which drives routing.
+
 | Field | Type | Max | Notes |
 |-------|------|-----|-------|
 | `metaLeadId` | `string` | 64 | Meta's own lead id. **Required for this block to be stored** — without it the whole `metaFacebook` object is discarded. |
 | `metaCreatedAt` | `string` (ISO-8601) | — | Submission time reported by Meta, e.g. `"2026-05-06T19:38:09.000Z"`. |
-| `platform` | `string` | 32 | `facebook` \| `instagram` \| `tiktok`. |
+| `platform` | `string` | 32 | `facebook` \| `instagram` \| `tiktok`. **The short forms `fb` and `ig` are accepted** and normalised to those, so a scenario forwarding Meta verbatim needs no translation. Anything else is kept, lowercased. |
 | `adId` | `string` | 64 | |
 | `adName` | `string` | 512 | |
 | `adType` | `string` | 64 | e.g. `"Video"`. |
@@ -439,7 +637,7 @@ metadata alongside the lead.
 | `adAccountId` | `string` | 64 | |
 | `businessAccountId` | `string` | 64 | |
 | `sourceAction` | `string` | 64 | e.g. `"Form"`. |
-| `finalPageName` | `string` | 255 | |
+| `finalPageName` | `string` | 255 | The Facebook/Instagram **page** the ad ran under, e.g. `"Provident Real Estate"`. Copied onto the lead. |
 | `customFields` | `object` | — | Any extra per-form question/answer pairs. Keys are preserved verbatim (non-ASCII safe). |
 
 ```jsonc
@@ -598,11 +796,21 @@ A field that consistently appears there means your value doesn't match Provident
 list — fix the value on your side or ask for the correct spelling. A lead whose
 `source` did not resolve loses its attribution.
 
+`funnel` (§4.2) is the one worth alerting on rather than merely logging. Every other
+unmatched lookup leaves a visibly empty field on the lead; an unmatched `funnel` instead
+files a perfectly complete lead onto the main sales pipeline, which looks exactly like a
+lead that never asked for a funnel at all. `intakeUnresolved.funnel` is the only signal
+that a whole business line has stopped receiving its leads.
+
 Quiz entries (§4.9) behave slightly differently from the rest: the answer **is**
 stored on the lead regardless, and a Provident admin can map the value once so every
 future submission of it resolves automatically. A quiz key appearing here repeatedly
 usually means a free-text question that would be better as a dropdown, or a numeric
 question where sending `value` would remove the guesswork.
+
+> A **merged** response (§7) carries no `intakeUnresolved` field at all — the enquiry was
+> folded into an existing lead rather than creating one. Guard for its absence wherever
+> you log this.
 
 ---
 
@@ -620,56 +828,182 @@ Consequence: repeat enquiries from the same person attach to the same contact �
 which is exactly what the sales team wants. Send phone numbers in **E.164**
 (`+971501234567`) so matching is reliable.
 
+> This is **not** the same question as lead merging (§7). Contact resolution asks "who is
+> this?" and always runs; merging asks "is this the same enquiry?" and only applies inside
+> the merge window. Two leads a month apart share one contact and stay two leads.
+
 ---
 
-## 7. Duplicates and retries — important
+## 7. Duplicates, merging and retries — important
 
-**The endpoint is not idempotent.** Posting the same payload twice creates **two
-leads** (both attached to the same contact). There is no de-duplication window,
-and `metaLeadId` does **not** prevent a duplicate lead — it only prevents the Meta
-metadata block from being attached twice.
+**The endpoint is not idempotent at the transport level.** There is no request id or
+`Idempotency-Key` header: a retried request can reach us twice, and `metaLeadId` does
+**not** protect you — it only stops the Meta metadata block being attached twice.
 
-So:
+What does protect you is **intake hygiene**, which runs *before* the lead is created and
+decides what a second enquiry from the same person actually is. Matching is on the
+**normalised phone first, then the email** — one more reason to send E.164.
 
-- **Never retry a request that returned any `2xx`, `400`, or `401`/`403`** —
-  the lead was either already created or will never be accepted.
-- **Only retry on network timeouts, `429`, and `5xx`**, with exponential backoff
+| A second enquiry arrives | What happens | Response |
+|---|---|---|
+| Within **24 hours** of the last one from the same phone / email | **Merged** — no new lead. The existing lead keeps its id, its stage and its agent, your payload is stored verbatim beside it, and the lead's merged-enquiry counter goes up. | `201` with `id` = the **existing** lead id, `merged: true`, and `matchedOn` set to `phone` or `email` |
+| **After** that window | A **new lead**, marked as a repeat of the earlier one. It is routed and worked normally — the marker is for the agent and for reporting, never a routing instruction. | Normal `201`, with `isRepeatLead: true` and `repeatOfLeadId` set |
+| Nothing earlier matches | A normal new lead. | Normal `201`, `isRepeatLead: false` |
+
+The window is a Provident-side setting (24 hours today). Treat it as "about a day", not as
+a constant to hard-code.
+
+**Two consequences you have to handle:**
+
+1. **`id` is not always a new lead.** When `merged` is `true` the id you get back is one
+   you already have. Don't record it as a second submission, and don't overwrite the
+   original submission's timestamps with this one's.
+2. **The merged body is short** — `id`, `merged`, `matchedOn` and nothing else. No
+   `contactId`, no `intakeUnresolved`, no `needsIntakeReview`, no `createdAt` (§8).
+
+> **Portal exemption.** Enquiries whose `source` is a property portal (Property Finder,
+> Bayut, Dubizzle) are **never** merged: those are listing-driven, so the same person
+> legitimately enquires about several properties held by different agents. A website or
+> ad-form source is not exempt — if that is you, expect merges.
+
+### Retry policy
+
+- **Never retry a request that returned any `2xx`, `400`, `401`/`403` or `422`** — the
+  lead was either already created (or merged) or will never be accepted.
+- **Only retry on network timeouts, `429` and `5xx`**, with exponential backoff
   (e.g. 1s, 4s, 15s, max 3 attempts).
-- A timeout is ambiguous — the lead may have been created. Prefer a retry (a
-  duplicate is recoverable, a lost lead is not), and keep your own record of which
-  submissions you have sent.
-- Store the returned lead `id` against your own submission record. It is the key
-  Provident will use for any question about a specific lead.
+- A timeout is ambiguous — the lead may have been created. Retry anyway: inside the merge
+  window the retry folds into the first attempt instead of duplicating it, which is
+  exactly the case this protects.
+- Store the returned lead `id` against your own submission record. It is the key Provident
+  will use for any question about a specific lead.
 
 ---
 
 ## 8. Responses
 
-### `201 Created`
+Both outcomes below return **`201`**. Branch on `merged` before reading anything else.
 
-The lead was created. These are the fields to read:
+### `201 Created` — a new lead
 
 | Field | Meaning |
 |-------|---------|
 | `id` | UUID of the created lead. **Store this.** |
+| `merged` | `false` — this is a new lead. |
 | `contactId` | UUID of the contact the lead was attached to (existing or newly created). |
 | `intakeUnresolved` | `null`, or a map of the values that could not be matched — see §5. |
 | `needsIntakeReview` | `true` when `intakeUnresolved` is non-empty. |
+| `isRepeatLead` | `true` when this person already had a lead older than the merge window (§7). |
+| `repeatOfLeadId` | The earlier lead's UUID when `isRepeatLead` is `true`, otherwise `null`. |
+| `isAgentEnquiry` | `true` when the enquiry was recognised as coming from a competing agent rather than a buyer. The lead is still created and worked; the flag keeps it out of lead-volume and cost-per-lead reporting. |
+| `agentEnquiryReason` | Why, when `isAgentEnquiry` is `true`: `known_agent`, `prior_lead`, `competitor_domain` or `manual`. `null` otherwise. |
+| `assignedTo` | The agent the lead landed on, or `null`. See the caveat below — `null` here does **not** mean nobody will get it. |
 | `createdAt` | Creation timestamp (ISO-8601, UTC). |
 
 ```jsonc
 {
   "id": "a1b2c3d4-5566-7788-99aa-bbccddeeff00",
+  "merged": false,
   "contactId": "0f1e2d3c-4455-6677-8899-aabbccddeeff",
   "intakeUnresolved": { "advertisingCampaign": "Google Ads — Q3" },
   "needsIntakeReview": true,
+  "isRepeatLead": false,
+  "repeatOfLeadId": null,
+  "isAgentEnquiry": false,
+  "agentEnquiryReason": null,
+  "assignedTo": {
+    "id": "3f2a91c4-7e10-4b8d-9c33-2a5b6d7e8f90",
+    "slug": "sarah-ahmed",
+    "name": "Sarah Ahmed",
+    "email": "sarah.ahmed@providentestate.com",
+    "phone": "+971501234567",
+    "whatsappPhone": "+971501234567",
+    "active": true
+  },
   "createdAt": "2026-07-27T06:31:04.512Z"
-  // … further fields may be present; ignore them
+  // … many further fields are present; ignore them
 }
 ```
 
-The response carries additional fields beyond the table above. They are not part of
-this contract, may change at any time, and must not be used in your logic.
+#### `assignedTo` — when you can rely on it
+
+`assignedTo` is filled **in the same transaction that creates the lead** in exactly two
+cases, and is reliable in both:
+
+- you sent a **`referenceNo`** (or `listingId`) that resolved to a listing — the lead goes
+  to that listing's agent;
+- you sent **`assignedBy`** with an agent's email.
+
+For every other lead, an assignment engine chooses the agent, and it runs **after** this
+response is sent. `assignedTo` will be `null` and that means *"not decided yet"*, **not**
+*"nobody"*. Do not treat it as a failure and do not tell the customer anything about it.
+
+To find out who it landed on, either poll **§10** or — better — take the **`lead.assigned`
+webhook** in §12 and be told.
+
+The agent object is the same shape everywhere it appears in this API:
+
+| Field | Meaning |
+|-------|---------|
+| `id` | Portal user id. The **stable, immutable** identifier for an agent — use this to key anything on your side. |
+| `slug` | Their website profile segment (`/team/<slug>/`), or `null` if they are not published. Human-readable, but an admin can change it; `id` cannot. |
+| `name` | Display name, e.g. `Sarah Ahmed`. Safe to say to a customer. |
+| `email` | Work email. |
+| `phone` | Work phone. |
+| `whatsappPhone` | The number to open a WhatsApp chat on. **Read this field** rather than reusing `phone` — they differ for some agents. |
+| `active` | `false` for a deactivated account. Do not route work to them. |
+
+**`active: false` is reachable and you must handle it.** Routing never *assigns* to a
+deactivated account, but a lead can be assigned to someone who is deactivated afterwards —
+1.4% of leads created in the last 90 days are in that state (read 2026-08-24). The agent is
+still returned rather than nulled, because who owns the lead is a fact worth recording. Do
+not message them and do not name them to a customer: that promises an introduction nobody
+will make. Treat it as you would `assignedTo: null` for messaging purposes, and keep the
+details for your own records.
+
+Personal phone numbers are never returned by any endpoint in this API.
+
+The response carries the whole lead record, well beyond the table above. Those extra
+fields are not part of this contract, may change at any time, and must not be used in
+your logic.
+
+### `201 Created` — merged into an existing lead
+
+When intake hygiene folds the enquiry into a lead created inside the merge window (§7),
+the status is still `201` but the body is **only these three fields**:
+
+```json
+{
+  "id": "a1b2c3d4-5566-7788-99aa-bbccddeeff00",
+  "merged": true,
+  "matchedOn": "phone",
+  "assignedTo": {
+    "id": "3f2a91c4-7e10-4b8d-9c33-2a5b6d7e8f90",
+    "slug": "sarah-ahmed",
+    "name": "Sarah Ahmed",
+    "email": "sarah.ahmed@providentestate.com",
+    "phone": "+971501234567",
+    "whatsappPhone": "+971501234567",
+    "active": true
+  }
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `id` | UUID of the **existing** lead the enquiry was folded into. |
+| `merged` | `true`. |
+| `matchedOn` | `"phone"` or `"email"` — which identifier matched. |
+| `assignedTo` | The agent who already owns that lead, or `null` if it has none. |
+
+`contactId`, `intakeUnresolved`, `needsIntakeReview` and `createdAt` are **absent** here.
+Code that reads them unconditionally breaks on the first repeat enquiry.
+
+`assignedTo` is usually **populated** on a merged response, and more reliably than on a new
+one: the lead already exists, so its owner is already known. A merged enquiry is a second
+customer message on a lead whose agent may have been notified once already — if you notify
+agents, this is who to notify, and you will also receive a `lead.assigned` webhook with
+`trigger: "merged"` (§12).
 
 ### Error format
 
@@ -685,6 +1019,8 @@ Every error uses the same envelope:
 }
 ```
 
+`422` adds one more key, `errors` — an array naming each field that failed validation.
+
 | Status | `code` | Meaning | What to do |
 |--------|--------|---------|------------|
 | `400` | `BAD_REQUEST` | `Provide at least one value in leadPhones or leadEmails` | Fix the payload. Never retry as-is. |
@@ -694,12 +1030,429 @@ Every error uses the same envelope:
 | `401` | `OAUTH_TOKEN_EXPIRED` | Token past `expires_in` | Get a new token, retry once. |
 | `401` | `UNAUTHORIZED` | (Token endpoint) bad client id/secret | Check credentials. Do not retry in a loop. |
 | `403` | `FORBIDDEN` | Your IP is not on the allowlist for this client | Send Provident your egress IPs. |
+| `422` | `VALIDATION_ERROR` | A parameter or field failed validation — including **an unrecognised query parameter**, which is rejected rather than ignored | Fix the request; the `errors` array names the offender. Never retry as-is. Mostly hit on the reference-data endpoints (§14); lead intake itself is deliberately forgiving and does not use this status. |
 | `429` | `RATE_LIMITED` | Daily request quota exceeded | Back off until `Retry-After` seconds, then resume. |
 | `5xx` | `INTERNAL_ERROR` | Server-side failure | Retry with backoff. |
 
 ---
 
-## 9. Rate limits
+## 9. Updating a lead — details that arrive later
+
+```
+PUT   /v2/public/leads/{id}
+PATCH /v2/public/leads/{id}
+```
+
+For the case where you do not have the whole enquiry at once: you send the name, email
+and phone the moment the customer appears, and the quiz answers, the budget and the area
+they actually want arrive minutes or hours later, once they have finished answering.
+
+**Send only what changed.** The field names, the lookups and the `intakeUnresolved`
+reporting are exactly those of `POST /v2/public/leads` (§4) — this is the same body, with
+three fields removed (below). Everything is optional, including phone and email: an update
+that carries nothing but a `quiz` block is normal and expected.
+
+### The four rules
+
+1. **A field you omit is left alone.** This is a PATCH in behaviour whichever verb you
+   use; `PUT` does not blank the fields you left out.
+2. **A field you send wins** over what the lead already had, including a value an agent
+   typed. You are the source; do not send a field you are not authoritative about.
+3. **An explicit `null` clears the column.** `"budgetMax": null` empties it; omitting
+   `budgetMax` does not.
+4. **A value that matches no CRM record leaves the column as it was** and is reported in
+   `intakeUnresolved`. A typo'd developer name never erases the developer already on the
+   lead.
+
+### Phones and emails are added, never replaced
+
+`leadPhones` and `leadEmails` are **appended**. A number or address the lead already has is
+ignored (matching is on the normalised form, so formatting differences do not duplicate);
+anything new is added. Nothing is ever deleted, and the primary number only changes when
+there was not one before. Re-sending the same phone on every update is therefore free.
+
+### Quiz answers replace, per quiz
+
+Answers for a `quizKey` you send **supersede** whatever that quiz previously recorded on
+the lead, so re-sending the same submission is idempotent and a corrected answer replaces
+the wrong one. Quizzes you do not mention are untouched. A quiz answer mapped to a lead
+field (budget, area, bedrooms…) is promoted onto the lead under the same precedence as on
+create: a field you sent explicitly in the same request beats the answer.
+
+### What you cannot change
+
+The lead's **workflow** belongs to Provident and is not writable here, whatever you send:
+stage, status, the agent it is assigned to, the funnel board it sits on, and the aging
+clock. Three create-only fields are therefore absent from this body:
+
+| Field | Why |
+|---|---|
+| `assignedBy` | An external system never moves a lead between agents. Who holds it is answered by §10 and by the `lead.assigned` webhook. |
+| `funnel` | A lead's stage belongs to its board; moving one without the other leaves it in a pipeline that cannot render it. |
+| `distributionType` | A Provident aging rule matches on this column, so changing it moves the lead to a different clock. Send it on create. |
+
+Sending them anyway is not an error — they are ignored, and kept verbatim in the lead's
+intake record.
+
+### Routing
+
+New details **do** send a lead **nobody holds** back through the assignment engine — the
+answers you just sent (area, developer, lead type, budget, languages) are exactly what it
+matches on, so a lead that could not be placed when all we knew was a phone number gets a
+second chance. The response says so in `rerouted`, and the outcome is asynchronous: poll
+§10 or wait for the `lead.assigned` webhook.
+
+A lead an agent **already holds** is never taken off them by an update.
+
+### The agent is told
+
+Every update that changes something posts a note on the lead's own timeline naming your
+integration and what changed, so the agent working it sees that new details arrived rather
+than discovering them by chance.
+
+### Request
+
+```http
+PUT /v2/public/leads/9f1c2f4e-7a3b-4d21-9e88-4d3f0b7c1a55 HTTP/1.1
+Host: prodapi.prov.ae
+Authorization: Bearer <access_token>
+Content-Type: application/json
+```
+
+```json
+{
+  "budgetMin": "1200000",
+  "budgetMax": "1800000",
+  "areaOfInterest": "Dubai Marina",
+  "quiz": {
+    "quizKey": "buyer_qualification_v2",
+    "quizName": "Buyer qualification",
+    "locale": "en",
+    "answers": [
+      { "questionKey": "timeframe", "label": "When are you looking to buy?", "optionKeys": ["3_6_months"] },
+      { "questionKey": "purpose", "label": "Purpose", "value": "Investment" }
+    ]
+  }
+}
+```
+
+### Response — `200 OK`
+
+```json
+{
+  "id": "9f1c2f4e-7a3b-4d21-9e88-4d3f0b7c1a55",
+  "updated": true,
+  "updatedFields": ["budgetMin", "budgetMax", "closingAreaId", "quizAnswers"],
+  "intakeUnresolved": null,
+  "needsIntakeReview": false,
+  "rerouted": false,
+  "assignedTo": {
+    "userId": "1f0b...",
+    "name": "Sara Haddad",
+    "email": "sara.haddad@provident.ae",
+    "phone": "+9715xxxxxxx"
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `updated` | `false` when the submission changed nothing — every value sent was already the lead's. Not an error, and not worth retrying. |
+| `updatedFields` | The lead columns this submission actually changed, by **CRM** name (`closingAreaId` is what `areaOfInterest` fills). `leadPhones` / `leadEmails` appear when a new one was added, `quizAnswers` when answers were written, `metaFacebook` when the Meta block was stored. |
+| `intakeUnresolved` | Values sent on **this** submission that matched no CRM record (§5). Merged with whatever was already unresolved on the lead — an update never clears a flag it did not answer. |
+| `rerouted` | `true` when the update sent an ownerless lead back through the assignment engine. |
+| `assignedTo` | The agent holding the lead as the response was written, or `null`. Same shape as §10. |
+
+### Errors
+
+| Status | Meaning |
+|---|---|
+| `400` | Body was not valid JSON, or `{id}` is not a UUID. |
+| `401` | Token missing, invalid or expired (§8). |
+| `404` | No lead with that id, or it has been deleted. |
+
+There is no `422` here: like `POST /public/leads`, this endpoint does not reject a body over
+a field it does not recognise or cannot match.
+
+### Notes worth reading once
+
+- **Use the `id` from the create response** — including a merged one, where the id is the
+  *existing* lead you were folded into (§7). Updating it updates that lead, which is
+  usually what you want and always what you asked for.
+- **This is not a way to avoid the merge window.** If the customer enquires again, POST it;
+  a second POST inside the window is merged and keeps both enquiries. An update is for
+  more detail about the *same* enquiry, not for a new one.
+- **Order does not matter, but time does.** Nothing stops a lead being updated after an
+  agent has worked it for a week. Rule 2 still applies — you will overwrite what they
+  changed, so only send fields you own.
+- Every update is recorded in Provident's audit log with your client, the changed field
+  list, and the verbatim body.
+
+---
+
+## 10. Who a lead was assigned to
+
+```
+GET /v2/public/leads/{id}/assignment
+Authorization: Bearer <access_token>
+```
+
+`{id}` is the lead `id` from the create response — a new one or a merged one, both work.
+
+**Why this exists.** For most leads the agent is chosen by a routing engine that runs
+*after* `POST /v2/public/leads` has answered you. So a lead with no owner on the create
+response is normal, and the question you actually need answered is not "is there an agent"
+but "**is there going to be one**". That is what `status` tells you.
+
+### Response — `200 OK`
+
+```json
+{
+  "leadId": "a1b2c3d4-5566-7788-99aa-bbccddeeff00",
+  "status": "assigned",
+  "agent": {
+    "id": "3f2a91c4-7e10-4b8d-9c33-2a5b6d7e8f90",
+    "slug": "sarah-ahmed",
+    "name": "Sarah Ahmed",
+    "email": "sarah.ahmed@providentestate.com",
+    "phone": "+971501234567",
+    "whatsappPhone": "+971501234567",
+    "active": true
+  },
+  "createdAt": "2026-08-24T09:14:02.881Z",
+  "retryAfterSeconds": null
+}
+```
+
+### The four states — branch on `status`, not on `agent`
+
+| `status` | What it means | What to do |
+|----------|---------------|------------|
+| `assigned` | A real, active agent owns the lead. `agent` is populated. | Contact them. Name them to the customer. |
+| `pending` | Routing has not finished. | Ask again after `retryAfterSeconds`. Tell the customer nothing yet. |
+| `unassigned` | Routing ran and **nobody took it**. This is final. | Send your generic reply. Notify no one. |
+| `pool` | The lead sits in a shared pool, deliberately ownerless until an agent claims it. | Send your generic reply. Notify no one. |
+
+`agent` is non-null only when `status` is `assigned`. `retryAfterSeconds` is non-null only
+when `status` is `pending`.
+
+> **`unassigned` and `pool` are common — roughly 30% of leads.** They are not errors and
+> not something to retry your way out of. Treating them as "still routing" leaves a
+> customer waiting forever for an introduction that is not coming.
+
+### Polling
+
+If you are not using the webhooks in §12, poll like this:
+
+- First check ~30 seconds after creating the lead. Routing is normally much faster, but
+  there is no benefit to asking sooner.
+- While `status` is `pending`, wait `retryAfterSeconds` and ask again.
+- Stop at ~2 minutes. Past that, `pending` will have resolved to something final on its
+  own; a lead still `pending` then is escalating and may take much longer.
+- `assigned`, `unassigned` and `pool` are all **final answers** — stop polling.
+
+Assignment can change later (a manual reassignment, an escalation). If you care about
+that, take the `lead.assigned` webhook — polling will not tell you.
+
+### What it does **not** return
+
+Only the agent's work contacts and the lead's status. Nothing about the customer, the
+enquiry, or the lead's content. If you need those, you already have them — you sent them.
+
+### Errors
+
+| Status | Code | Meaning |
+|--------|------|---------|
+| `400` | `VALIDATION_ERROR` | `{id}` is not a valid UUID |
+| `404` | `NOT_FOUND` | No such lead, or it has been deleted |
+
+---
+
+## 11. Recording the agent's response time
+
+```
+POST /v2/public/leads/{id}/response-time
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{ "seconds": 47 }
+```
+
+How long the assigned agent took to respond to this lead, in **whole seconds**, measured
+from whatever you consider the customer's first contact. Provident reports on this figure,
+so send the number you would defend to a manager.
+
+| Field | Type | Rules |
+|-------|------|-------|
+| `seconds` | integer | Required. `0` or more, at most `2592000` (30 days). |
+
+### Response — `200 OK`
+
+```json
+{
+  "leadId": "a1b2c3d4-5566-7788-99aa-bbccddeeff00",
+  "agentResponseSeconds": 47,
+  "agentRespondedAt": "2026-08-24T09:15:29.104Z"
+}
+```
+
+`agentRespondedAt` is set by Provident at the moment of the call, not by you. It is what
+distinguishes a genuine 47-second response from a figure backfilled three days later.
+
+**Last write wins.** Calling this twice for the same lead overwrites; it is safe to retry.
+Timing is not sensitive — minutes or hours after the fact is fine.
+
+**A lead with no assignee is accepted, not rejected.** A tracking link can be clicked by an
+agent who claimed the lead out of the pool, or by a previous owner, and the lead's assignee
+at the moment you write is not necessarily who responded. Rejecting those writes would lose
+exactly the slowest responses — the ones the metric exists to surface — so the endpoint
+records the number regardless of `status`.
+
+### Errors
+
+| Status | Code | Meaning |
+|--------|------|---------|
+| `400` | `VALIDATION_ERROR` | `{id}` is not a valid UUID |
+| `404` | `NOT_FOUND` | No such lead, or it has been deleted |
+| `422` | `VALIDATION_ERROR` | `seconds` missing, not an integer, negative, or over the cap |
+
+---
+
+## 12. Webhooks — being told instead of asking
+
+Provident can POST to **your** endpoint when something happens to a lead. This replaces
+polling §10 entirely and is the recommended integration.
+
+To switch it on, send Provident:
+
+1. a URL for each event you want (they can be the same URL);
+2. whether you want a shared secret, and what to call the header if not the default.
+
+### Authentication
+
+Every call carries the shared secret in a header:
+
+```
+X-Provident-Webhook-Secret: <the secret you agreed>
+```
+
+Compare it in constant time and reject anything else with `401`. The secret is the only
+thing proving the call came from Provident — nothing in the body is authentication.
+
+### The two events
+
+| `event` | Fires when |
+|---------|------------|
+| `lead.created` | Any lead is created in the CRM, from any channel |
+| `lead.assigned` | A lead's owner becomes a real, active agent |
+
+> **Nothing is sent when a lead ends up with no owner.** "Nobody took it" is a state, not
+> an event — ask §10 for it. If you are waiting for a `lead.assigned` that never comes,
+> that is the answer, and it is why you should still have a timeout.
+
+> **`lead.created` will include the leads you sent us**, unless you ask Provident to
+> exclude your API client — which you almost certainly want, or you will greet the same
+> customer twice. Say so when you request the webhook.
+
+### `lead.created`
+
+```jsonc
+{
+  "event": "lead.created",
+  "deliveryId": "9f8e7d6c-5b4a-3210-fedc-ba9876543210",
+  "occurredAt": "2026-08-24T09:14:03.220Z",
+  "lead": {
+    "id": "a1b2c3d4-5566-7788-99aa-bbccddeeff00",
+    "url": "https://portal.prov.ae/en/crm/leads/a1b2c3d4-5566-7788-99aa-bbccddeeff00",
+    "pageUrl": "https://providentestate.com/new-projects/the-w-arada-developments-dubai-harbour/",
+    "createdAt": "2026-08-24T09:14:02.881Z",
+    "stage": "New Lead",
+    "source": "Website",
+    "leadType": "Primary Buyer",
+    "campaign": null,
+    "initialInquiry": "Interested in a 2BR",
+    "listing": { "id": "…", "referenceNo": "PS-24082614", "title": "2BR in Collective" }
+  },
+  "customer": {
+    "fullName": "Ahmed Khan",
+    "firstName": "Ahmed",
+    "lastName": "Khan",
+    "phones": ["+971501112233"],
+    "emails": ["ahmed@example.com"]
+  },
+  "property": {
+    "developer": "Emaar Properties",
+    "community": "Dubai Hills Estate",
+    "location": "Collective",
+    "locationPath": "Dubai, Dubai Hills Estate, Collective",
+    "project": "Collective 2.0",
+    "propertyType": "Apartment",
+    "bedrooms": "2"
+  },
+  "agent": { "id": "…", "name": "Sarah Ahmed", "whatsappPhone": "+971501234567", "…": "…" },
+  "intake": {
+    "clientId": "…",
+    "clientName": "WhatsApp Bot",
+    "integrationRef": "wa-property-inquiry"
+  }
+}
+```
+
+**Everything in `property` is a display name, not an id** — it is meant to go straight into
+a message a person reads. `community` is `null` for some leads (the location tree is
+uneven), which is why `location` and `locationPath` travel alongside it; fall back to those
+rather than leaving a hole in a sentence.
+
+`agent` may be `null`: this event fires when the lead is created, which is often before it
+has an owner. Wait for `lead.assigned`.
+
+**`lead.url` and `lead.pageUrl` are not interchangeable.** `url` opens the lead inside the
+Provident CRM and is for staff. `pageUrl` is the **public page the enquiry came from** — the
+listing or project page the customer was actually looking at — and is the link to put in a
+message to an agent. It is `null` when there was no public page (Meta lead-ads, leads
+created inside the CRM by staff); render that as "N/A" rather than falling back to `url`,
+which an agent may not be able to open.
+
+### `lead.assigned`
+
+Same `lead`, `customer`, `property` and `agent` blocks, plus:
+
+| Field | Meaning |
+|-------|---------|
+| `trigger` | `created`, `routed`, `reassigned` or `merged` — see below |
+| `previousAgentId` | The previous owner's id, or `null` |
+
+`agent` is **always** populated on this event.
+
+| `trigger` | Means |
+|-----------|-------|
+| `created` | The lead had an owner from the moment it was created — a listing's agent, or an explicit `assignedBy` |
+| `routed` | The routing engine placed a lead that had no owner |
+| `reassigned` | The lead moved from one agent to another |
+| `merged` | A repeat enquiry was folded into an existing lead that already has an owner (§7) |
+
+`merged` is the one worth special-casing: it means a **second** customer message arrived on
+a lead whose agent you may already have notified once. The customer is not new; the
+enquiry is.
+
+### Your endpoint's contract
+
+- **Answer `2xx` as soon as you have stored the event.** Do the work afterwards. Provident
+  waits 10 seconds and no longer.
+- **`4xx` is permanent.** Anything other than `408` or `429` is taken as "understood and
+  refused" and is never retried. Do not use `400` for a temporary problem.
+- **`5xx`, `408`, `429` and timeouts are retried** at 30s, 1m, 5m, 10m, 15m, 30m, then
+  given up on. A partner outage of about half an hour loses nothing.
+- **Be idempotent on `deliveryId`.** A retry after your `2xx` was lost in transit is
+  indistinguishable from a first attempt, so at-least-once is the guarantee — not
+  exactly-once.
+- **Order is not guaranteed.** A `lead.assigned` that was retried can arrive after a later
+  `reassigned` for the same lead. `occurredAt` is stamped when the body was built and is
+  what to compare.
+
+---
+
+## 13. Rate limits
 
 Every authenticated request is counted per client, per **UTC day**. The response
 carries the current state:
@@ -724,7 +1477,7 @@ IP in the message. Send your production egress IPs when you request credentials.
 
 ---
 
-## 10. Reference data endpoints (optional)
+## 14. Reference data endpoints (optional)
 
 Alongside lead submission you can **read** Provident's locations, developers and
 projects. Use them to populate dropdowns on your side, to send `areaOfInterest` /
@@ -738,21 +1491,67 @@ All of them:
 - **count against the same rate limit**, so cache the results (these lists change
   rarely — a daily refresh is plenty; do not call them per form submission).
 
-| Endpoint | Returns |
-|----------|---------|
-| `GET /v2/public/projects/filters` | Locations, developers, property types, statuses — all in one call |
-| `GET /v2/public/developers` | Paginated developers |
-| `GET /v2/public/developers/search?q=…` | Developer search by name / slug / description |
-| `GET /v2/public/developers/{id}` | One developer |
-| `GET /v2/public/projects` | Paginated projects (filterable) |
-| `GET /v2/public/projects/{id}` | One project |
-| `GET /v2/public/projects/map` | Projects inside a map bounding box |
-| `GET /v2/public/project-statuses` | Project status list |
+| Endpoint | Returns | Paging |
+|----------|---------|--------|
+| `GET /v2/public/projects/filters` | Locations, developers, property types, statuses — all in one call | — |
+| `GET /v2/public/locations/search?search=…` | Community / area type-ahead | `limit` / `offset` |
+| `GET /v2/public/locations/{id}` | One community or area | — |
+| `GET /v2/public/developers` | Developers | `limit` / `offset` |
+| `GET /v2/public/developers/search?q=…` | Developer search by name / slug / description | `limit` / `offset` |
+| `GET /v2/public/developers/{id}` | One developer | — |
+| `GET /v2/public/projects` | Projects (filterable) | `page` / `limit` |
+| `GET /v2/public/projects/{id}` | One project | — |
+| `GET /v2/public/projects/map` | Projects inside a map bounding box | — |
+| `GET /v2/public/project-statuses` | Project status list | — |
 
-### 10.1 Locations (and the other lookup lists)
+> **The two paging styles are not interchangeable.** Locations and developers take
+> `limit` / `offset`; projects still take `page` / `limit`. An unrecognised query
+> parameter is **rejected, not ignored** — sending `?page=` to the developers endpoint
+> returns `422 VALIDATION_ERROR` (`property page should not exist`), not page 1.
 
-There is no standalone locations endpoint — locations come from the project filters
-call, together with the developer, property-type and status lists:
+### 14.1 Locations
+
+Two ways in, for two different jobs.
+
+**A type-ahead picker** — search the whole community / area tree:
+
+```bash
+curl -H "Authorization: Bearer <access_token>" \
+  "https://devapi.prov.ae/v2/public/locations/search?search=marina&limit=20"
+```
+
+```jsonc
+{
+  "data": [
+    { "id": "…uuid…", "name": "Dubai Marina", "level": "2", "path": "Dubai, Dubai Marina" },
+    { "id": "…uuid…", "name": "Marina", "level": "3", "path": "Ajman, Al Zorah, Marina" }
+  ],
+  "meta": { "limit": 20, "offset": 0, "total": 350 }
+}
+```
+
+| Parameter | Meaning |
+|-----------|---------|
+| `search` | Search term (aliases: `q`, `query`). Omit it to page the whole tree. |
+| `limit` | Page size, default `50`, **capped at 200**. |
+| `offset` | Records to skip. Default `0`. |
+| `sort`, `order` | Ordering. Relevance-ranked by default when a term is given. |
+
+`GET /v2/public/locations/{id}` returns one node in the same shape, for re-displaying a
+location the visitor picked earlier.
+
+`path` is the full ancestry (`"Ajman, Al Zorah, Marina"`) and is there because **names are
+not unique** — the tree has thousands of nodes and hundreds of repeated leaf names. Show
+`path` in your picker so the user can tell two "Marina"s apart.
+
+> **Send the `name`, not the id.** The lead payload has no location-id field:
+> `areaOfInterest` (§4.3) is matched by name. And a name that matches **more than one**
+> node is treated as unmatched — the lead is still created, the field is left empty and
+> the text comes back in `intakeUnresolved` (§5). If your picker offers an area whose
+> `name` is not unique, expect that field not to link.
+
+**The bulk lookup lists** — locations, developers, property types and statuses in one
+call, which is what you want for pre-populating static dropdowns:
 
 ```bash
 curl -H "Authorization: Bearer <access_token>" \
@@ -790,20 +1589,36 @@ curl -H "Authorization: Bearer <access_token>" \
 }
 ```
 
-**This is the list to validate against.** Sending an `areaOfInterest` or
-`propertyTypeInterest` that appears here guarantees the lead is linked rather than
-landing in `intakeUnresolved` (§5).
+Note the two lists answer different questions: the filters call returns only the
+locations that have projects attached, the search endpoint covers the whole tree.
+**Validate `propertyTypeInterest` against the filters call**, and `areaOfInterest`
+against whichever of the two you populated your form from.
 
-### 10.2 Developers
+### 14.2 Developers
 
 ```bash
 curl -H "Authorization: Bearer <access_token>" \
-  "https://devapi.prov.ae/v2/public/developers?page=1&limit=50&popular=true"
+  "https://devapi.prov.ae/v2/public/developers?limit=50&offset=0&popular=true"
 ```
 
-Query parameters: `page` (1-indexed), `limit`, `popular` (`true` / `false` — omit for
-all). `GET /v2/public/developers/search` takes the same parameters plus `q` (aliases:
-`search`, `query`) and ranks exact-name matches first.
+> **Changed 2026-08.** This endpoint used to take `page` and return
+> `meta: { page, limit, total, totalPages }`. It now takes `limit` / `offset` and returns
+> `meta: { limit, offset, total }`. **`page` is no longer accepted at all** — sending it
+> returns `422 VALIDATION_ERROR`, it is not ignored. Update any integration written
+> against the old shape.
+
+| Parameter | Meaning |
+|-----------|---------|
+| `limit` | Page size, default `50`, **capped at 200**. `meta.limit` echoes the value actually applied after clamping. |
+| `offset` | Records to skip. Default `0`. |
+| `search` | Matches name, slug, description and id (aliases: `q`, `query`). A CSV matches any term; a `"quoted"` term is matched exactly. |
+| `popular` | `"true"` / `"false"` — filter by the popular flag. Omit for all enabled developers. |
+| `sort` | CSV of sort keys, most significant first, each able to carry its own direction: `popular:desc,name:asc` or `-name`. Keys: `id`, `name`, `slug`, `description`, `logoUrl`, `imageUrl`, `popular`, `contactId`, `createdAt`, `updatedAt`, plus `relevance` when searching. Unknown keys are ignored. |
+| `order` | Default direction for sort keys that don't carry one (`asc` / `desc`). |
+
+`GET /v2/public/developers/search` is the same endpoint with relevance ranking applied;
+it takes exactly the same parameters and falls back to the plain list when no term is
+given.
 
 ```jsonc
 {
@@ -815,18 +1630,21 @@ all). `GET /v2/public/developers/search` takes the same parameters plus `q` (ali
       "logoUrl": "https://media.prov.ae/…",
       "imageUrl": "https://media.prov.ae/…",
       "description": "…",
-      "popular": true
-      // further fields may be present — ignore them
+      "enabled": true,
+      "popular": true,
+      "contactId": null,
+      "createdAt": "2026-07-21T10:09:32.393Z",
+      "updatedAt": "2026-07-21T10:09:32.393Z"
     }
   ],
-  "meta": { "page": 1, "limit": 50, "total": 120, "totalPages": 3 }
+  "meta": { "limit": 50, "offset": 0, "total": 244 }
 }
 ```
 
 Only enabled developers are returned. `GET /v2/public/developers/{id}` returns a
 single developer, or `404` if it does not exist or is disabled.
 
-### 10.3 Projects
+### 14.3 Projects
 
 ```bash
 curl -H "Authorization: Bearer <access_token>" \
@@ -884,12 +1702,14 @@ record), `404` if it is not published. `GET /v2/public/projects/map` takes requi
 `latMin`, `latMax`, `lngMin`, `lngMax` bounds plus the same filters and returns map
 pins.
 
-### 10.4 Attaching this data to a lead
+### 14.4 Attaching this data to a lead
 
 **Developers map directly.** Send the developer's `name` (or `slug`) as
 `developerName`, or its UUID as `developerId` — see §4.5. Locations and property
-types map the same way: send the `name` from the filters call as `areaOfInterest`
-and `propertyTypeInterest`.
+types map by **name only** (there is no id field for either on a lead): send the `name`
+from the filters call — or, for locations, from `GET /v2/public/locations/search` — as
+`areaOfInterest` and `propertyTypeInterest`. A location name shared by more than one node
+in the tree cannot be matched; see §14.1.
 
 **Projects have no top-level field.** Sending `projectId` at the top level is accepted
 but ignored (§4.10). Two ways to tie a lead to a project:
@@ -906,7 +1726,7 @@ but ignored (§4.10). Two ways to tie a lead to a project:
 
 ---
 
-## 11. Reference implementations
+## 15. Reference implementations
 
 ### Node.js (18+, built-in `fetch`)
 
@@ -956,6 +1776,14 @@ async function createLead(lead, retryOn401 = true) {
   if (!res.ok) throw new Error(`Lead create failed: ${res.status} ${await res.text()}`);
 
   const created = await res.json();
+
+  // Always branch on `merged` first (§7/§8). A merged response carries only
+  // id / merged / matchedOn — reading contactId or intakeUnresolved here is a bug.
+  if (created.merged) {
+    console.info(`Merged into existing lead ${created.id} (matched on ${created.matchedOn})`);
+    return created.id;
+  }
+
   if (created.needsIntakeReview) {
     console.warn('Unmatched intake values:', created.intakeUnresolved);
   }
@@ -1006,6 +1834,13 @@ def create_lead(lead):
     )
     r.raise_for_status()
     body = r.json()
+
+    # Branch on `merged` first (§7/§8): a merged response carries only
+    # id / merged / matchedOn, and body["id"] is a lead you already have.
+    if body.get("merged"):
+        print("Merged into existing lead", body["id"], "matched on", body.get("matchedOn"))
+        return body["id"]
+
     if body.get("needsIntakeReview"):
         print("Unmatched intake values:", body.get("intakeUnresolved"))
     return body["id"]
@@ -1048,12 +1883,18 @@ $lead = provident_post("$base/public/leads", [
     'source'        => 'Website',
 ], ["Authorization: Bearer $token"]);
 
+// A merged enquiry (§7) returns only id / merged / matchedOn — $lead['id'] is then
+// an existing lead, and contactId / intakeUnresolved are absent from the response.
+if (!empty($lead['merged'])) {
+    error_log("Merged into existing lead {$lead['id']} on {$lead['matchedOn']}");
+}
+
 echo $lead['id'];
 ```
 
 ---
 
-## 12. Go-live checklist
+## 16. Go-live checklist
 
 - [ ] Integration built and tested against **`https://devapi.prov.ae/v2`**.
 - [ ] Credentials stored server-side only (env vars / secrets manager), never in
@@ -1062,10 +1903,26 @@ echo $lead['id'];
 - [ ] `401` triggers exactly one token refresh + retry; no retry loops.
 - [ ] Retries only on timeout / `429` / `5xx`, with exponential backoff.
 - [ ] Returned lead `id` stored against your own submission record.
+- [ ] **`merged` checked on every `201`** before reading `contactId`, `intakeUnresolved`,
+      `needsIntakeReview` or `createdAt` — a merged response has none of them (§7, §8).
+- [ ] A merged `id` recognised as an **existing** lead, not recorded as a new one.
+- [ ] **`assignedTo: null` on a `201` understood as "not decided yet", not "nobody"** — the
+      routing engine runs after the response is sent (§8).
+- [ ] If you notify agents: either the `lead.assigned` webhook is wired up (§12) **or** you
+      poll `GET /leads/{id}/assignment` (§10) — and in either case you branch on all four
+      `status` values, with `unassigned` and `pool` handled as final answers rather than
+      retried.
+- [ ] If you take webhooks: your endpoint verifies `X-Provident-Webhook-Secret`, answers
+      `2xx` within 10 seconds before doing any work, and is idempotent on `deliveryId`.
+- [ ] If you take `lead.created`: you asked Provident to exclude your own API client, so
+      the leads you submit are not sent back to you.
 - [ ] `intakeUnresolved` logged and reviewed — no field appearing there routinely.
 - [ ] Phone numbers sent in E.164 format (`+9715…`).
 - [ ] `source`, `subSource`, `eventType`, `marketingType` values confirmed against
       Provident's accepted lists.
+- [ ] Reference-data calls (§14) use the right paging for each endpoint — `limit`/`offset`
+      for locations and developers, `page`/`limit` for projects. An unknown query
+      parameter is rejected with `422`, not ignored.
 - [ ] If you send `quiz` (§4.9): every question has a **stable `questionKey`** and every
       dropdown answer a **stable `optionKey`**, identical across languages and unchanged
       when the wording is edited. Confirm this before launch — retrofitting keys after
@@ -1079,7 +1936,7 @@ echo $lead['id'];
 
 ---
 
-## 13. Support
+## 17. Support
 
 Send Provident the following when reporting a problem:
 
