@@ -1,0 +1,51 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Provident Lead Intake API",
+  "description": "Post leads into Provident's CRM, follow what happens to them, and read our reference data.",
+  "colors": {
+    "primary": "#2f4960",
+    "light": "#f3793c",
+    "dark": "#1a2942"
+  },
+  "favicon": "/favicon.svg",
+  "logo": {
+    "light": "/logo/light.svg",
+    "dark": "/logo/dark.svg"
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Guide",
+        "groups": [
+          {
+            "group": "Get started",
+            "pages": ["introduction", "lead-intake-api"]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "openapi": "api-reference/openapi.json"
+      }
+    ]
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "Support",
+        "href": "mailto:it@provident.ae"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Request credentials",
+      "href": "mailto:it@provident.ae?subject=Lead%20Intake%20API%20credentials"
+    }
+  },
+  "footer": {
+    "socials": {
+      "website": "https://www.providentestate.com"
+    }
+  }
+}

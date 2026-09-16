@@ -1,0 +1,73 @@
+---
+title: "Introduction"
+description: "What the Provident Lead Intake API does, and the shortest path from nothing to a lead in our CRM."
+---
+
+The Lead Intake API is how a partner, a landing page or an ad platform puts an enquiry
+into Provident's CRM. A lead posted here is indistinguishable from one typed in by an
+agent: it is deduplicated against our contacts, routed to an agent by our assignment
+engine, and starts the same follow-up clocks.
+
+<CardGroup cols={2}>
+  <Card title="Read the handbook" icon="book-open" href="/lead-intake-api">
+    The complete integration guide — authentication, every field, matching behaviour,
+    webhooks and the go-live checklist.
+  </Card>
+  <Card title="Browse the endpoints" icon="code" href="/api-reference/lead-intake/create-a-crm-lead">
+    Generated from our OpenAPI spec, with a request builder you can call from the page.
+  </Card>
+</CardGroup>
+
+## The shape of an integration
+
+<Steps>
+  <Step title="Get credentials">
+    Ask Provident for a client id and secret. There is no self-service signup.
+  </Step>
+  <Step title="Exchange them for a token">
+    OAuth 2.0 Client Credentials against `POST /v2/oauth2/token`. No user login, no
+    redirect, no consent screen — your server talks to ours.
+  </Step>
+  <Step title="Post the lead">
+    `POST /v2/public/leads` with the customer's name and at least one way to reach them.
+    Everything else is optional and improves routing.
+  </Step>
+  <Step title="Find out where it landed">
+    Either take the [webhooks](/lead-intake-api#12-webhooks-—-being-told-instead-of-asking)
+    and be told, or poll `GET /v2/public/leads/{id}/assignment`. Prefer the webhooks.
+  </Step>
+</Steps>
+
+## Environments
+
+| Environment | Base URL | Use for |
+| --- | --- | --- |
+| Staging / dev | `https://devapi.prov.ae/v2` | Integration and testing |
+| Production | `https://prodapi.prov.ae/v2` | Live leads |
+
+<Note>
+  Build against staging first. Credentials are issued per environment — a production
+  secret will not authenticate against dev, and vice versa.
+</Note>
+
+## Two things worth knowing up front
+
+<AccordionGroup>
+  <Accordion title="An unrecognised value is stored, not rejected">
+    Most optional fields are matched against our own catalogues — sources, campaigns,
+    developers, locations. When a value matches nothing we keep it verbatim and return it
+    under `intakeUnresolved` rather than failing the request. **A lead is never lost over
+    a field we could not match.**
+  </Accordion>
+  <Accordion title="An ownerless lead is not always a failure">
+    Routing runs *after* we answer your `POST`, so `assignedTo` can legitimately be
+    absent at create time. `GET /v2/public/leads/{id}/assignment` distinguishes
+    "routing hasn't finished" from "nobody took it" — read it before treating an
+    ownerless lead as an error.
+  </Accordion>
+</AccordionGroup>
+
+## Support
+
+Integration questions go to [it@provident.ae](mailto:it@provident.ae). Include the lead
+id from the response — it is the fastest way for us to trace what happened.

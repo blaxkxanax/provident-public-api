@@ -1,0 +1,27 @@
+name: Check docs
+
+# Mintlify deploys from `main` via its GitHub App; this job does not publish anything.
+# It is the gate that catches a bad link or an unparseable spec before the site rebuilds.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: docs.json and the OpenAPI spec are valid JSON
+        run: |
+          python3 -c "import json;json.load(open('docs.json'))"
+          python3 -c "import json;s=json.load(open('api-reference/openapi.json'));print('spec version',s['info']['version'],'-',len(s['paths']),'paths')"
+
+      - name: No broken links
+        run: npx -y mint@latest broken-links
