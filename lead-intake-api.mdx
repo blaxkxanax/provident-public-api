@@ -11,6 +11,17 @@ description: "The complete integration handbook for POST /v2/public/leads — au
 > `docs/PUBLIC_LEADS_ENDPOINT.md` and `public-lead-full-example.md`, were folded into
 > this document and deleted on 2026-07-31; nothing else describes this endpoint.)
 
+> **Changed 2026-09-19 — read this if you are already integrated.**
+> 1. New **`comments[]`** on both `POST` and `PUT`/`PATCH` `/v2/public/leads` (§4.11) —
+>    relay a conversation that happened somewhere else onto the lead's own thread, up to
+>    five comments per request, **each with its own `date`** so a chat sent an hour later
+>    still reads in the order it happened.
+> 2. Both responses now carry **`comments: { added, skipped }`** (`null` when you sent
+>    none). **`skipped` is customer messages that were not kept** — going over the cap of
+>    five does not fail your request, so nothing else will tell you.
+> 3. Nothing existing changed. If you do not send `comments`, every request and response
+>    behaves exactly as before.
+>
 > **Changed 2026-09-06 — read this if you are already integrated.**
 > 1. New **`PUT /v2/public/leads/{id}`** (§9) — send details you did not have when you
 >    created the lead, most obviously quiz answers the customer finished afterwards. Send
@@ -341,7 +352,29 @@ strings or `null` placeholders).
         "answerLabel": ["Villa", "Townhouse"]
       }
     ]
-  }
+  },
+
+  "comments": [
+    {
+      "body": "Hi, I'm looking for a 2-bed in JVC under 1.3M",
+      "date": "2026-09-18T06:10:00.000Z",
+      "type": "whatsapp_inbound",
+      "chatChannel": "whatsapp"
+    },
+    {
+      "body": "Happy to help — are you buying to live in or to invest?",
+      "date": "2026-09-18T06:12:30.000Z",
+      "type": "whatsapp_outbound",
+      "chatChannel": "whatsapp"
+    },
+    {
+      "body": "To invest. Budget is around 1.3M, cash.",
+      "date": "2026-09-18T06:15:00.000Z",
+      "type": "whatsapp_inbound",
+      "chatChannel": "whatsapp",
+      "isPinned": true
+    }
+  ]
 }
 ```
 
@@ -780,6 +813,69 @@ CRM field either — if you have data that should drive routing or reporting, as
 Provident to add it to this specification first, or send it through `quiz` (§4.9),
 which is designed for exactly that and needs no change on our side.
 
+### 4.11 `comments` — relaying a conversation
+
+For the case the rest of this API has no answer for: the enquiry that produced the lead
+happened **somewhere else**, in a chat, and the lead arrives without it. `comments[]`
+writes that conversation onto the lead's own thread, where the agent already reads
+everything else about it.
+
+Each entry is one comment:
+
+| Field | Type | Required | Meaning |
+|---|---|---|---|
+| `body` | `string` | yes | The text. Trimmed. Longer than 5000 characters is truncated, not rejected. |
+| `date` | `string` (ISO-8601) | no | When it was **said** — see below. Defaults to now. |
+| `type` | `string` (≤64) | no | What kind of comment it is, so the CRM can render it as more than a note. Free text today: stored verbatim, matched against nothing. Agree a vocabulary with us and keep it stable. |
+| `chatChannel` | `string` (≤64) | no | The conversation it came from — `whatsapp`. Free text, stored verbatim. |
+| `isPinned` | `boolean` | no | Pin it to the top of the thread. Default `false`. |
+
+Accepted on **`POST`** and on **`PUT`/`PATCH`**, identically. On an update they are
+**added** to what the lead already has; nothing you sent earlier is replaced or removed.
+
+#### `date` is not the time you send the request
+
+This is the whole point of the field. A conversation relayed an hour after it happened is
+still displayed, and still sorted, at the time each message was **actually sent** — so it
+reads in order beside the agent's own notes rather than arriving as a block stamped
+"now". The time it reached us is recorded separately and is never lost.
+
+Two limits: an unparseable date falls back to now, and a date **more than 24 hours in the
+future** is ignored the same way — a clock-skewed sender cannot park a message at the top
+of a thread forever. A date in the past is always honoured; that is what the field is for.
+
+#### The order is the order you send
+
+**The first entry in the array is the eldest**, and appears at the bottom of the CRM
+timeline. Entries you send without a date keep the order you sent them in. Entries that
+carry the same timestamp — a transcript accurate only to the minute — also keep it.
+
+#### Maximum 5 per request, and going over does not fail
+
+Anything past the fifth entry is **skipped**, and so is any entry with an empty body. The
+request still succeeds, because failing it would throw away a real customer enquiry over a
+comment. The count comes back as `comments.skipped` on the response:
+
+```json
+"comments": { "added": 5, "skipped": 2 }
+```
+
+**Read it.** A sender that ignores it loses customer messages silently. Send a longer
+conversation as consecutive `PUT`s, five at a time, oldest batch first.
+
+#### What these are, and are not
+
+- They are **visible** comments — not internal notes, not an audit trail.
+- They are **not agent activity**: posting them never restarts the lead's response clock
+  and never counts as somebody having worked it.
+- `@`-mentions in the text notify nobody.
+- They are attributed to your integration, not to a person.
+
+One caveat worth knowing before you build on this: comments are a **placeholder for a
+proper chat view**, chosen because it puts the conversation in front of an agent today.
+Send `type` and `chatChannel` on every message even though nothing reads them yet — they
+are what will let these be lifted into a real chat later without guesswork.
+
 ---
 
 ## 5. Matching behaviour and `intakeUnresolved`
@@ -911,6 +1007,7 @@ Both outcomes below return **`201`**. Branch on `merged` before reading anything
 | `isAgentEnquiry` | `true` when the enquiry was recognised as coming from a competing agent rather than a buyer. The lead is still created and worked; the flag keeps it out of lead-volume and cost-per-lead reporting. |
 | `agentEnquiryReason` | Why, when `isAgentEnquiry` is `true`: `known_agent`, `prior_lead`, `competitor_domain` or `manual`. `null` otherwise. |
 | `assignedTo` | The agent the lead landed on, or `null`. See the caveat below — `null` here does **not** mean nobody will get it. |
+| `comments` | `{ added, skipped }` when you sent a `comments[]` array (§4.11), `null` when you did not. **`skipped` is customer messages we did not keep** — send them again. |
 | `createdAt` | Creation timestamp (ISO-8601, UTC). |
 
 ```jsonc
@@ -933,6 +1030,7 @@ Both outcomes below return **`201`**. Branch on `merged` before reading anything
     "whatsappPhone": "+971501234567",
     "active": true
   },
+  "comments": { "added": 3, "skipped": 0 },
   "createdAt": "2026-07-27T06:31:04.512Z"
   // … many further fields are present; ignore them
 }
@@ -983,7 +1081,7 @@ your logic.
 ### `201 Created` — merged into an existing lead
 
 When intake hygiene folds the enquiry into a lead created inside the merge window (§7),
-the status is still `201` but the body is **only these three fields**:
+the status is still `201` but the body is **only these few fields**:
 
 ```json
 {
@@ -998,9 +1096,13 @@ the status is still `201` but the body is **only these three fields**:
     "phone": "+971501234567",
     "whatsappPhone": "+971501234567",
     "active": true
-  }
+  },
+  "comments": { "added": 2, "skipped": 0 }
 }
 ```
+
+Any `comments[]` you sent are written to the **surviving** lead — the conversation belongs
+on the lead the customer actually has. `comments` is `null` when you sent none.
 
 | Field | Meaning |
 |-------|---------|
@@ -1065,7 +1167,7 @@ reporting are exactly those of `POST /v2/public/leads` (§4) — this is the sam
 three fields removed (below). Everything is optional, including phone and email: an update
 that carries nothing but a `quiz` block is normal and expected.
 
-### The four rules
+### The five rules
 
 1. **A field you omit is left alone.** This is a PATCH in behaviour whichever verb you
    use; `PUT` does not blank the fields you left out.
@@ -1076,6 +1178,11 @@ that carries nothing but a `quiz` block is normal and expected.
 4. **A value that matches no CRM record leaves the column as it was** and is reported in
    `intakeUnresolved`. A typo'd developer name never erases the developer already on the
    lead.
+
+5. **Comments are added, never replaced.** `comments[]` (§4.11) appends up to five
+   comments per request to the lead's thread, oldest first. Nothing you sent earlier is
+   touched, so a long conversation can be relayed across consecutive calls and still read
+   in order.
 
 ### Phones and emails are added, never replaced
 
@@ -1123,6 +1230,9 @@ Every update that changes something posts a note on the lead's own timeline nami
 integration and what changed, so the agent working it sees that new details arrived rather
 than discovering them by chance.
 
+An update carrying **only** `comments` posts no such note — the comments are themselves
+what the agent reads, and a note announcing them would sit on top of them on every batch.
+
 ### Request
 
 ```http
@@ -1145,7 +1255,15 @@ Content-Type: application/json
       { "questionKey": "timeframe", "label": "When are you looking to buy?", "optionKeys": ["3_6_months"] },
       { "questionKey": "purpose", "label": "Purpose", "value": "Investment" }
     ]
-  }
+  },
+  "comments": [
+    {
+      "body": "Following up — is the Marina unit still available?",
+      "date": "2026-09-19T05:40:12.000Z",
+      "type": "whatsapp_inbound",
+      "chatChannel": "whatsapp"
+    }
+  ]
 }
 ```
 
@@ -1155,7 +1273,7 @@ Content-Type: application/json
 {
   "id": "9f1c2f4e-7a3b-4d21-9e88-4d3f0b7c1a55",
   "updated": true,
-  "updatedFields": ["budgetMin", "budgetMax", "closingAreaId", "quizAnswers"],
+  "updatedFields": ["budgetMin", "budgetMax", "closingAreaId", "quizAnswers", "comments"],
   "intakeUnresolved": null,
   "needsIntakeReview": false,
   "rerouted": false,
@@ -1164,17 +1282,19 @@ Content-Type: application/json
     "name": "Sara Haddad",
     "email": "sara.haddad@provident.ae",
     "phone": "+9715xxxxxxx"
-  }
+  },
+  "comments": { "added": 1, "skipped": 0 }
 }
 ```
 
 | Field | Meaning |
 |---|---|
 | `updated` | `false` when the submission changed nothing — every value sent was already the lead's. Not an error, and not worth retrying. |
-| `updatedFields` | The lead columns this submission actually changed, by **CRM** name (`closingAreaId` is what `areaOfInterest` fills). `leadPhones` / `leadEmails` appear when a new one was added, `quizAnswers` when answers were written, `metaFacebook` when the Meta block was stored. |
+| `updatedFields` | The lead columns this submission actually changed, by **CRM** name (`closingAreaId` is what `areaOfInterest` fills). `leadPhones` / `leadEmails` appear when a new one was added, `quizAnswers` when answers were written, `metaFacebook` when the Meta block was stored, `comments` when at least one comment was posted. |
 | `intakeUnresolved` | Values sent on **this** submission that matched no CRM record (§5). Merged with whatever was already unresolved on the lead — an update never clears a flag it did not answer. |
 | `rerouted` | `true` when the update sent an ownerless lead back through the assignment engine. |
 | `assignedTo` | The agent holding the lead as the response was written, or `null`. Same shape as §10. |
+| `comments` | `{ added, skipped }` when you sent a `comments[]` array (§4.11), `null` when you did not. |
 
 ### Errors
 

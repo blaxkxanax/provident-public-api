@@ -2,8 +2,8 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Provident — Lead Intake API",
-    "version": "1.4.0",
-    "description": "Server-to-server API for pushing leads into the Provident CRM.\n\nCore endpoints:\n1. `POST /oauth2/token` — exchange client credentials for a bearer token.\n2. `POST /public/leads` — create a CRM lead.\n3. `PUT /public/leads/{id}` — add details you did not have when you created it (quiz answers the customer finished afterwards, a budget, an area). Send only what changed; phones and emails are appended, never replaced, and the lead's stage, status, owner and funnel are not writable.\n\nOptional read-only reference data, using the same token: locations, developers, projects and project statuses. Use them to send values that match ours, or to show project content on your own pages. They share the lead endpoint's rate limit, so cache them.\n\nAuthentication is OAuth 2.0 Client Credentials; there is no user login. Note that the `/v2` prefix is part of the server URL and is mandatory.\n\nThe intake is deliberately forgiving: name-based lookup fields that cannot be matched do NOT fail the request — the lead is still created and the unmatched values are returned in `intakeUnresolved`.\n\nThe endpoint is not idempotent at the transport level, but intake hygiene runs before the lead is created: a second enquiry from the same phone/email within the merge window (~24h) is MERGED into the existing lead and returns a different, much shorter 201 body — `{ id, merged: true, matchedOn }` — with no contactId, intakeUnresolved, needsIntakeReview or createdAt. Always branch on `merged` before reading anything else. Enquiries from property-portal sources (Property Finder, Bayut, Dubizzle) are exempt and never merge. Retry only on network timeouts, 429 and 5xx.",
+    "version": "1.5.0",
+    "description": "Server-to-server API for pushing leads into the Provident CRM.\n\nCore endpoints:\n1. `POST /oauth2/token` — exchange client credentials for a bearer token.\n2. `POST /public/leads` — create a CRM lead.\n3. `PUT /public/leads/{id}` — add details you did not have when you created it (quiz answers the customer finished afterwards, a budget, an area). Send only what changed; phones and emails are appended, never replaced, and the lead's stage, status, owner and funnel are not writable.\n\nBoth the create and the update body accept `comments[]` (max 5 per request, each with its own `date`), which writes a conversation that happened elsewhere onto the lead's thread; the response reports `comments: { added, skipped }` and going over the cap skips rather than fails.\n\nOptional read-only reference data, using the same token: locations, developers, projects and project statuses. Use them to send values that match ours, or to show project content on your own pages. They share the lead endpoint's rate limit, so cache them.\n\nAuthentication is OAuth 2.0 Client Credentials; there is no user login. Note that the `/v2` prefix is part of the server URL and is mandatory.\n\nThe intake is deliberately forgiving: name-based lookup fields that cannot be matched do NOT fail the request — the lead is still created and the unmatched values are returned in `intakeUnresolved`.\n\nThe endpoint is not idempotent at the transport level, but intake hygiene runs before the lead is created: a second enquiry from the same phone/email within the merge window (~24h) is MERGED into the existing lead and returns a different, much shorter 201 body — `{ id, merged: true, matchedOn }` — with no contactId, intakeUnresolved, needsIntakeReview or createdAt. Always branch on `merged` before reading anything else. Enquiries from property-portal sources (Property Finder, Bayut, Dubizzle) are exempt and never merge. Retry only on network timeouts, 429 and 5xx.",
     "contact": {
       "name": "Provident API support"
     }
@@ -2578,6 +2578,15 @@
             ],
             "nullable": true,
             "description": "The agent the lead landed on. NULL means 'not decided yet' — the routing engine runs after this response is sent — NOT 'nobody'. Reliable only when you sent referenceNo/listingId or assignedBy; otherwise use GET /public/leads/{id}/assignment or the lead.assigned webhook."
+          },
+          "comments": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/LeadCommentsResult"
+              }
+            ],
+            "nullable": true,
+            "description": "What became of the `comments[]` you sent; null when you sent none."
           }
         },
         "additionalProperties": true
@@ -2937,6 +2946,14 @@
             "nullable": true,
             "description": "Your handle for the specific automation behind this lead — a Make scenario name, a webhook id, a form build. Free text: stored verbatim, never matched against anything, and never reported in `intakeUnresolved`.\n\nIt identifies an INTEGRATION, not a submission, so keep it stable across every lead that automation sends; a per-lead unique id makes it useless for grouping. Values are only distinguished within one sender, so two partners can both use `scenario-1`.\n\nDo NOT put your own name here. The submitting OAuth client is recorded automatically from the access token — there is no field for it, because attribution a sender can write is not attribution.",
             "example": "make:meta-leadgen-eu"
+          },
+          "comments": {
+            "type": "array",
+            "maxItems": 5,
+            "items": {
+              "$ref": "#/components/schemas/LeadComment"
+            },
+            "description": "Comments to write onto the lead's thread, OLDEST FIRST — the first entry in the array is the eldest and appears at the bottom of the CRM timeline. Entries sent without a `date`, and entries sharing the same timestamp, keep the order you sent them in. Maximum 5 per request: anything past the fifth is SKIPPED and reported back as `comments.skipped` rather than failing the request, because failing it would throw away a real customer enquiry over a comment. Send a longer conversation as consecutive PUTs, five at a time, oldest batch first. On an update these are ADDED to what the lead already has."
           }
         },
         "additionalProperties": true
@@ -3160,7 +3177,7 @@
       },
       "MergedLead": {
         "type": "object",
-        "description": "The enquiry was folded into a lead created inside the merge window (~24h) rather than creating a new one. The status is still 201 but the body is ONLY these four fields: there is no contactId, intakeUnresolved, needsIntakeReview or createdAt. `id` is a lead you already have — do not record it as a second submission. `assignedTo` is usually populated here (the lead already exists, so its owner is already known).",
+        "description": "The enquiry was folded into a lead created inside the merge window (~24h) rather than creating a new one. The status is still 201 but the body is ONLY these few fields: there is no contactId, intakeUnresolved, needsIntakeReview or createdAt. `id` is a lead you already have — do not record it as a second submission. `assignedTo` is usually populated here (the lead already exists, so its owner is already known).",
         "required": [
           "id",
           "merged",
@@ -3195,6 +3212,15 @@
             ],
             "nullable": true,
             "description": "The agent who already owns the lead the enquiry was folded into, or null if it has none."
+          },
+          "comments": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/LeadCommentsResult"
+              }
+            ],
+            "nullable": true,
+            "description": "Any `comments[]` you sent are written to the SURVIVING lead — the conversation belongs on the lead the customer actually has. Null when you sent none."
           }
         },
         "additionalProperties": false
@@ -3963,6 +3989,14 @@
             "nullable": true,
             "description": "Your handle for the specific automation behind this lead — a Make scenario name, a webhook id, a form build. Free text: stored verbatim, never matched against anything, and never reported in `intakeUnresolved`.\n\nIt identifies an INTEGRATION, not a submission, so keep it stable across every lead that automation sends; a per-lead unique id makes it useless for grouping. Values are only distinguished within one sender, so two partners can both use `scenario-1`.\n\nDo NOT put your own name here. The submitting OAuth client is recorded automatically from the access token — there is no field for it, because attribution a sender can write is not attribution.",
             "example": "make:meta-leadgen-eu"
+          },
+          "comments": {
+            "type": "array",
+            "maxItems": 5,
+            "items": {
+              "$ref": "#/components/schemas/LeadComment"
+            },
+            "description": "Comments to write onto the lead's thread, OLDEST FIRST — the first entry in the array is the eldest and appears at the bottom of the CRM timeline. Entries sent without a `date`, and entries sharing the same timestamp, keep the order you sent them in. Maximum 5 per request: anything past the fifth is SKIPPED and reported back as `comments.skipped` rather than failing the request, because failing it would throw away a real customer enquiry over a comment. Send a longer conversation as consecutive PUTs, five at a time, oldest batch first. On an update these are ADDED to what the lead already has."
           }
         },
         "additionalProperties": true
@@ -3983,12 +4017,13 @@
             "items": {
               "type": "string"
             },
-            "description": "Lead columns this submission actually changed, by CRM name (`closingAreaId` is what `areaOfInterest` fills). `leadPhones`/`leadEmails` appear when a new one was added, `quizAnswers` when answers were written, `metaFacebook` when the Meta block was stored.",
+            "description": "Lead columns this submission actually changed, by CRM name (`closingAreaId` is what `areaOfInterest` fills). `leadPhones`/`leadEmails` appear when a new one was added, `quizAnswers` when answers were written, `metaFacebook` when the Meta block was stored, `comments` when at least one comment was posted.",
             "example": [
               "budgetMin",
               "budgetMax",
               "closingAreaId",
-              "quizAnswers"
+              "quizAnswers",
+              "comments"
             ]
           },
           "intakeUnresolved": {
@@ -4015,6 +4050,73 @@
             ],
             "nullable": true,
             "description": "The agent holding the lead as this response was written, or null."
+          },
+          "comments": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/LeadCommentsResult"
+              }
+            ],
+            "nullable": true,
+            "description": "What became of the `comments[]` you sent; null when you sent none."
+          }
+        }
+      },
+      "LeadComment": {
+        "type": "object",
+        "description": "One comment to write onto the lead's thread. Built for relaying a conversation that happened somewhere else — a WhatsApp chat that qualified the enquiry — so the agent reads it where they read everything else about the lead. These are VISIBLE comments, they are not agent activity (posting one never restarts the lead's response clock), @-mentions in the text notify nobody, and they are attributed to your integration rather than to a person.",
+        "required": [
+          "body"
+        ],
+        "properties": {
+          "body": {
+            "type": "string",
+            "maxLength": 5000,
+            "description": "The comment text. Trimmed. Longer than 5000 characters is truncated rather than rejected; an entry with an empty body is skipped.",
+            "example": "Hi, I'm looking for a 2-bed in JVC under 1.3M"
+          },
+          "date": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "description": "When this comment was SAID — not when you are sending it. This is the timestamp the CRM thread sorts and displays, so a conversation relayed hours later still reads in its real order beside the agent's own notes; the arrival time is recorded separately and never lost. Defaults to now. An unparseable value falls back to now, and so does a date more than 24 hours in the future, so a skewed clock cannot park a message at the top of the thread. A date in the past is always honoured.",
+            "example": "2026-09-18T06:10:00.000Z"
+          },
+          "type": {
+            "type": "string",
+            "maxLength": 64,
+            "nullable": true,
+            "description": "What kind of comment this is, so the CRM can render it as something other than a plain note. Free text today — stored verbatim, matched against nothing — so agree a vocabulary with Provident and keep it stable.",
+            "example": "whatsapp_inbound"
+          },
+          "chatChannel": {
+            "type": "string",
+            "maxLength": 64,
+            "nullable": true,
+            "description": "The conversation this message came from, when it came from one. Free text, stored verbatim. Send it even though nothing reads it yet: it is what will let these comments be lifted into a real chat view later.",
+            "example": "whatsapp"
+          },
+          "isPinned": {
+            "type": "boolean",
+            "default": false,
+            "description": "Pin this comment to the top of the lead's thread. Pinned comments keep their own chronological order among themselves.",
+            "example": false
+          }
+        }
+      },
+      "LeadCommentsResult": {
+        "type": "object",
+        "description": "What became of the `comments[]` array you sent. `null` when you sent none, so \"I sent none\" and \"none of mine were written\" stay distinguishable.",
+        "properties": {
+          "added": {
+            "type": "integer",
+            "description": "Comments written to the lead's thread.",
+            "example": 3
+          },
+          "skipped": {
+            "type": "integer",
+            "description": "Comments in the array that were NOT written — past the cap of 5, or empty. READ THIS: these are customer messages that were not kept. Send them again in a follow-up PUT.",
+            "example": 0
           }
         }
       }
