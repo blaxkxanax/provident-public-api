@@ -2,8 +2,8 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Provident — Lead Intake API",
-    "version": "1.5.0",
-    "description": "Server-to-server API for pushing leads into the Provident CRM.\n\nCore endpoints:\n1. `POST /oauth2/token` — exchange client credentials for a bearer token.\n2. `POST /public/leads` — create a CRM lead.\n3. `PUT /public/leads/{id}` — add details you did not have when you created it (quiz answers the customer finished afterwards, a budget, an area). Send only what changed; phones and emails are appended, never replaced, and the lead's stage, status, owner and funnel are not writable.\n\nBoth the create and the update body accept `comments[]` (max 5 per request, each with its own `date`), which writes a conversation that happened elsewhere onto the lead's thread; the response reports `comments: { added, skipped }` and going over the cap skips rather than fails.\n\nOptional read-only reference data, using the same token: locations, developers, projects and project statuses. Use them to send values that match ours, or to show project content on your own pages. They share the lead endpoint's rate limit, so cache them.\n\nAuthentication is OAuth 2.0 Client Credentials; there is no user login. Note that the `/v2` prefix is part of the server URL and is mandatory.\n\nThe intake is deliberately forgiving: name-based lookup fields that cannot be matched do NOT fail the request — the lead is still created and the unmatched values are returned in `intakeUnresolved`.\n\nThe endpoint is not idempotent at the transport level, but intake hygiene runs before the lead is created: a second enquiry from the same phone/email within the merge window (~24h) is MERGED into the existing lead and returns a different, much shorter 201 body — `{ id, merged: true, matchedOn }` — with no contactId, intakeUnresolved, needsIntakeReview or createdAt. Always branch on `merged` before reading anything else. Enquiries from property-portal sources (Property Finder, Bayut, Dubizzle) are exempt and never merge. Retry only on network timeouts, 429 and 5xx.",
+    "version": "1.6.0",
+    "description": "Server-to-server API for pushing leads into the Provident CRM.\n\nCore endpoints:\n1. `POST /oauth2/token` — exchange client credentials for a bearer token.\n2. `POST /public/leads` — create a CRM lead.\n3. `PUT /public/leads/{id}` — add details you did not have when you created it (quiz answers the customer finished afterwards, a budget, an area). Send only what changed; phones and emails are appended, never replaced, and the lead's stage, status, owner and funnel are not writable.\n\nBoth the create and the update body accept `comments[]` (max 5 per request, each with its own `date`), which writes a conversation that happened elsewhere onto the lead's thread; the response reports `comments: { added, skipped }` and going over the cap skips rather than fails.\n\nOptional read-only reference data, using the same token: locations, developers, projects and project statuses. Use them to send values that match ours, or to show project content on your own pages. They share the lead endpoint's rate limit, so cache them.\n\nOptional compliance check, using the same token: `POST /public/dncr/check` checks up to 20 UAE mobile numbers against the UAE Do Not Call Registry before you contact them. Answers are cached for 180 days, and `fresh: true` asks the registry again.\n\nAuthentication is OAuth 2.0 Client Credentials; there is no user login. Note that the `/v2` prefix is part of the server URL and is mandatory.\n\nThe intake is deliberately forgiving: name-based lookup fields that cannot be matched do NOT fail the request — the lead is still created and the unmatched values are returned in `intakeUnresolved`.\n\nThe endpoint is not idempotent at the transport level, but intake hygiene runs before the lead is created: a second enquiry from the same phone/email within the merge window (~24h) is MERGED into the existing lead and returns a different, much shorter 201 body — `{ id, merged: true, matchedOn }` — with no contactId, intakeUnresolved, needsIntakeReview or createdAt. Always branch on `merged` before reading anything else. Enquiries from property-portal sources (Property Finder, Bayut, Dubizzle) are exempt and never merge. Retry only on network timeouts, 429 and 5xx.",
     "contact": {
       "name": "Provident API support"
     }
@@ -34,6 +34,10 @@
     {
       "name": "Lead follow-up",
       "description": "Reading back who a lead was assigned to, and recording the agent response time"
+    },
+    {
+      "name": "Do Not Call Registry",
+      "description": "Check UAE mobile numbers against the Do Not Call Registry before contacting them"
     },
     {
       "name": "Webhooks",
@@ -1848,6 +1852,181 @@
           },
           "429": {
             "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/public/dncr/check": {
+      "post": {
+        "tags": [
+          "Do Not Call Registry"
+        ],
+        "summary": "Check numbers against the Do Not Call Registry",
+        "description": "Checks up to 20 UAE mobile numbers against the UAE Do Not Call Registry. Answers are cached for 180 days; send `fresh: true` (or `?fresh=true`) to ask the registry again. A number that is not a UAE mobile comes back as `invalid` and does not fail the request. **`not_found` is not a clearance**: it means the registry holds no record of the number.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "fresh",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "true",
+                "false",
+                "1",
+                "0"
+              ]
+            },
+            "description": "Same as `fresh` in the body. Either one set to true skips the cache."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DncrCheckRequest"
+              },
+              "example": {
+                "phones": [
+                  "0501234567",
+                  "+971 50 765 4321"
+                ],
+                "fresh": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "One answer per number sent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DncrCheckResponse"
+                },
+                "example": {
+                  "data": [
+                    {
+                      "input": "0501234567",
+                      "phone": "0501234567",
+                      "e164": "+971501234567",
+                      "status": "registered",
+                      "onDncr": true,
+                      "dncrStatus": "TRUE",
+                      "etisalatStatus": null,
+                      "checkedAt": "2026-10-06T08:12:44.120Z",
+                      "source": "cache",
+                      "error": null
+                    },
+                    {
+                      "input": "+971 50 765 4321",
+                      "phone": "0507654321",
+                      "e164": "+971507654321",
+                      "status": "not_registered",
+                      "onDncr": false,
+                      "dncrStatus": "FALSE",
+                      "etisalatStatus": null,
+                      "checkedAt": "2026-10-06T09:30:02.871Z",
+                      "source": "fresh",
+                      "error": null
+                    },
+                    {
+                      "input": "041234567",
+                      "phone": null,
+                      "e164": null,
+                      "status": "invalid",
+                      "onDncr": null,
+                      "dncrStatus": null,
+                      "etisalatStatus": null,
+                      "checkedAt": null,
+                      "source": null,
+                      "error": "\"041234567\" is not a UAE mobile number. DNCR checks cover UAE mobiles only: 05XXXXXXXX or 9715XXXXXXXX."
+                    }
+                  ],
+                  "meta": {
+                    "requested": 3,
+                    "unique": 2,
+                    "invalid": 1,
+                    "fromCache": 1,
+                    "fromEtisalat": 1,
+                    "fresh": false,
+                    "cacheTtlDays": 180,
+                    "maxNumbersPerRequest": 20,
+                    "transactionId": "3f1c2a9e-6a43-4b4e-9d0e-6c1f1d0b7a52"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "More than 20 numbers. Nothing was checked.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "statusCode": 400,
+                  "code": "DNCR_TOO_MANY_NUMBERS",
+                  "message": "A DNCR check takes at most 20 phone numbers; 21 were sent.",
+                  "path": "/v2/public/dncr/check",
+                  "timestamp": "2026-10-06T09:30:02.871Z",
+                  "details": {
+                    "max": 20,
+                    "received": 21
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationFailed"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "502": {
+            "description": "The registry could not be reached. Nothing in the request was checked. Retry with backoff.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "statusCode": 502,
+                  "code": "DNCR_UPSTREAM_ERROR",
+                  "message": "The DNCR registry could not be reached. Try again in a few minutes.",
+                  "path": "/v2/public/dncr/check",
+                  "timestamp": "2026-10-06T09:30:02.871Z"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "DNCR checks are not enabled on this environment.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "statusCode": 503,
+                  "code": "DNCR_NOT_CONFIGURED",
+                  "message": "DNCR checks are not configured on this server.",
+                  "path": "/v2/public/dncr/check",
+                  "timestamp": "2026-10-06T09:30:02.871Z"
+                }
+              }
+            }
           }
         }
       }
@@ -4117,6 +4296,168 @@
             "type": "integer",
             "description": "Comments in the array that were NOT written — past the cap of 5, or empty. READ THIS: these are customer messages that were not kept. Send them again in a follow-up PUT.",
             "example": 0
+          }
+        }
+      },
+      "DncrCheckRequest": {
+        "type": "object",
+        "required": [
+          "phones"
+        ],
+        "properties": {
+          "phones": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 20,
+            "items": {
+              "type": "string"
+            },
+            "description": "UAE mobile numbers, at most 20. Accepted forms: 05XXXXXXXX, 5XXXXXXXX, 9715XXXXXXXX, +9715XXXXXXXX, 009715XXXXXXXX. Spaces and dashes are ignored. A number sent twice is checked once.",
+            "example": [
+              "0501234567",
+              "+971 50 765 4321"
+            ]
+          },
+          "fresh": {
+            "type": "boolean",
+            "default": false,
+            "description": "Skip the 180-day cache and ask the registry again for every number. Use it only when you need an answer as of right now. `?fresh=true` does the same."
+          }
+        }
+      },
+      "DncrResult": {
+        "type": "object",
+        "required": [
+          "input",
+          "phone",
+          "e164",
+          "status",
+          "onDncr",
+          "dncrStatus",
+          "etisalatStatus",
+          "checkedAt",
+          "source",
+          "error"
+        ],
+        "properties": {
+          "input": {
+            "type": "string",
+            "description": "The number exactly as you sent it.",
+            "example": "+971 50 765 4321"
+          },
+          "phone": {
+            "type": "string",
+            "nullable": true,
+            "description": "Local form; null when invalid.",
+            "example": "0507654321"
+          },
+          "e164": {
+            "type": "string",
+            "nullable": true,
+            "example": "+971507654321"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "registered",
+              "not_registered",
+              "not_found",
+              "invalid",
+              "unavailable"
+            ],
+            "description": "`registered`: on the registry, so do not contact it for marketing. `not_registered`: checked and clear. `not_found`: the registry holds no record of the number. This is NOT a clearance. `invalid`: not a UAE mobile, so it was not checked. `unavailable`: no answer came back for this number; try again later."
+          },
+          "onDncr": {
+            "type": "boolean",
+            "nullable": true,
+            "description": "true on the registry, false clear, null in every other case."
+          },
+          "dncrStatus": {
+            "type": "string",
+            "nullable": true,
+            "description": "The registry's raw status.",
+            "example": "FALSE"
+          },
+          "etisalatStatus": {
+            "type": "string",
+            "nullable": true,
+            "description": "The registry's per-number message, if any. It gives the reason for `not_found`."
+          },
+          "checkedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "description": "When the registry gave this answer."
+          },
+          "source": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "cache",
+              "fresh",
+              null
+            ],
+            "description": "`cache` if served from a previous check, `fresh` if checked on this request."
+          },
+          "error": {
+            "type": "string",
+            "nullable": true,
+            "description": "Why the number is `invalid` or `unavailable`."
+          }
+        }
+      },
+      "DncrCheckResponse": {
+        "type": "object",
+        "required": [
+          "data",
+          "meta"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DncrResult"
+            },
+            "description": "One row per number sent, in the order sent."
+          },
+          "meta": {
+            "type": "object",
+            "properties": {
+              "requested": {
+                "type": "integer",
+                "description": "Numbers sent."
+              },
+              "unique": {
+                "type": "integer",
+                "description": "Distinct valid numbers."
+              },
+              "invalid": {
+                "type": "integer"
+              },
+              "fromCache": {
+                "type": "integer"
+              },
+              "fromEtisalat": {
+                "type": "integer",
+                "description": "Numbers checked against the registry on this request."
+              },
+              "fresh": {
+                "type": "boolean"
+              },
+              "cacheTtlDays": {
+                "type": "integer",
+                "example": 180
+              },
+              "maxNumbersPerRequest": {
+                "type": "integer",
+                "example": 20
+              },
+              "transactionId": {
+                "type": "string",
+                "nullable": true,
+                "description": "Reference for the registry call, when one was made. Quote it when reporting a problem."
+              }
+            }
           }
         }
       }

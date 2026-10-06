@@ -11,6 +11,12 @@ description: "The complete integration handbook for POST /v2/public/leads — au
 > `docs/PUBLIC_LEADS_ENDPOINT.md` and `public-lead-full-example.md`, were folded into
 > this document and deleted on 2026-07-31; nothing else describes this endpoint.)
 
+> **Changed 2026-10-06.**
+> 1. New **`POST /v2/public/dncr/check`** (§15). It checks up to 20 UAE mobile numbers against
+>    the Do Not Call Registry before you contact them.
+> 2. Sections 15–17 of the previous revision are now 16–18.
+> 3. Nothing existing changed.
+>
 > **Changed 2026-09-19 — read this if you are already integrated.**
 > 1. New **`comments[]`** on both `POST` and `PUT`/`PATCH` `/v2/public/leads` (§4.11) —
 >    relay a conversation that happened somewhere else onto the lead's own thread, up to
@@ -66,6 +72,7 @@ Two endpoints are involved:
 | 3 | Add details you did not have at first | `PUT /v2/public/leads/{id}` |
 | 4 | Find out who the lead was assigned to | `GET /v2/public/leads/{id}/assignment` |
 | 5 | Record the agent's response time | `POST /v2/public/leads/{id}/response-time` |
+| 6 | Check numbers against the Do Not Call Registry (optional) | `POST /v2/public/dncr/check` |
 
 Provident can also **call your server** when a lead is created or assigned, which
 replaces polling #4 entirely — see §12.
@@ -1859,7 +1866,100 @@ but ignored (§4.10). Two ways to tie a lead to a project:
 
 ---
 
-## 15. Reference implementations
+## 15. Do Not Call Registry check (optional)
+
+Before you call, SMS or WhatsApp a UAE mobile number for marketing, you can check it against
+the UAE **Do Not Call Registry (DNCR)**. Provident runs the check against Etisalat's registry
+and returns one answer per number.
+
+```http
+POST /v2/public/dncr/check
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{ "phones": ["0501234567", "+971 50 765 4321"], "fresh": false }
+```
+
+- Uses the **same bearer token** as everything else. No extra credentials.
+- **At most 20 numbers per request.** Sending 21 returns `400 DNCR_TOO_MANY_NUMBERS`, and
+  nothing is checked. To check more, split them into batches of 20.
+- **UAE mobiles only.** These forms are accepted: `05XXXXXXXX`, `5XXXXXXXX`, `9715XXXXXXXX`,
+  `+9715XXXXXXXX` and `009715XXXXXXXX`. Spaces and dashes are ignored. Anything else, such as a
+  landline or a foreign number, comes back as `invalid` and the rest of the request still runs.
+- **Answers are cached for 180 days.** A number checked recently is answered straight from the
+  cache. Send `"fresh": true` (or `?fresh=true`) only when you need the registry's answer as of
+  right now, for example just before a campaign goes out. Each `checkedAt` tells you how old an
+  answer is.
+- Counts against the same rate limit as the other endpoints (§13).
+
+### Response — `200 OK`
+
+One row per number you sent, **in the order you sent them**. A number sent twice is checked
+once and comes back twice.
+
+```json
+{
+  "data": [
+    {
+      "input": "0501234567",
+      "phone": "0501234567",
+      "e164": "+971501234567",
+      "status": "registered",
+      "onDncr": true,
+      "dncrStatus": "TRUE",
+      "etisalatStatus": null,
+      "checkedAt": "2026-10-06T08:12:44.120Z",
+      "source": "cache",
+      "error": null
+    },
+    {
+      "input": "+971 50 765 4321",
+      "phone": "0507654321",
+      "e164": "+971507654321",
+      "status": "not_registered",
+      "onDncr": false,
+      "dncrStatus": "FALSE",
+      "etisalatStatus": null,
+      "checkedAt": "2026-10-06T09:30:02.871Z",
+      "source": "fresh",
+      "error": null
+    }
+  ],
+  "meta": {
+    "requested": 2, "unique": 2, "invalid": 0,
+    "fromCache": 1, "fromEtisalat": 1, "fresh": false,
+    "cacheTtlDays": 180, "maxNumbersPerRequest": 20,
+    "transactionId": "3f1c2a9e-6a43-4b4e-9d0e-6c1f1d0b7a52"
+  }
+}
+```
+
+### Statuses: branch on `status`
+
+| `status` | Meaning | `onDncr` |
+|----------|---------|----------|
+| `registered` | The number **is on the registry**. Do not contact it for marketing. | `true` |
+| `not_registered` | Checked, and not on the registry. | `false` |
+| `not_found` | The registry holds **no record** of this number (`etisalatStatus` gives the reason). | `null` |
+| `invalid` | Not a UAE mobile, so it was not checked. `error` says why. | `null` |
+| `unavailable` | The registry did not return an answer for this number. Try again later. | `null` |
+
+> **`not_found` does not mean you may contact the number.** It means the registry could not
+> answer for it. What you do with those numbers is your compliance decision. Do not treat
+> them the same as `not_registered` just because `onDncr` is not `true`.
+
+### Errors
+
+| Status | `code` | Meaning | What to do |
+|--------|--------|---------|------------|
+| `400` | `DNCR_TOO_MANY_NUMBERS` | More than 20 numbers. `details.max` and `details.received` give the counts. | Split into batches of 20. |
+| `422` | `VALIDATION_ERROR` | `phones` missing, empty or not an array of strings | Fix the body. |
+| `502` | `DNCR_UPSTREAM_ERROR` | The registry could not be reached. Nothing in the request was checked. | Retry with backoff. |
+| `503` | `DNCR_NOT_CONFIGURED` | DNCR checks are not enabled on this environment | Contact Provident. |
+
+---
+
+## 16. Reference implementations
 
 ### Node.js (18+, built-in `fetch`)
 
@@ -2027,7 +2127,7 @@ echo $lead['id'];
 
 ---
 
-## 16. Go-live checklist
+## 17. Go-live checklist
 
 - [ ] Integration built and tested against **`https://devapi.prov.ae/v2`**.
 - [ ] Credentials stored server-side only (env vars / secrets manager), never in
@@ -2062,6 +2162,8 @@ echo $lead['id'];
       leads have arrived means merging the duplicates by hand.
 - [ ] If you send `quiz`: numeric and date answers send a machine `value` where you have
       one, rather than relying on us parsing the label.
+- [ ] If you use the DNCR check (§15): batches of at most 20 numbers, `fresh` only when you
+      need it, and a deliberate decision about `not_found` numbers, which are not a clearance.
 - [ ] Expected daily volume communicated so the rate limit is sized correctly.
 - [ ] Production egress IPs shared (if IP allowlisting will be enabled).
 - [ ] Production credentials issued and base URL switched to
@@ -2069,7 +2171,7 @@ echo $lead['id'];
 
 ---
 
-## 17. Support
+## 18. Support
 
 Send Provident the following when reporting a problem:
 
