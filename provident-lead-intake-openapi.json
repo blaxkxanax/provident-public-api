@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Provident — Lead Intake API",
-    "version": "1.6.0",
+    "version": "1.8.0",
     "description": "Server-to-server API for pushing leads into the Provident CRM.\n\nCore endpoints:\n1. `POST /oauth2/token` — exchange client credentials for a bearer token.\n2. `POST /public/leads` — create a CRM lead.\n3. `PUT /public/leads/{id}` — add details you did not have when you created it (quiz answers the customer finished afterwards, a budget, an area). Send only what changed; phones and emails are appended, never replaced, and the lead's stage, status, owner and funnel are not writable.\n\nBoth the create and the update body accept `comments[]` (max 5 per request, each with its own `date`), which writes a conversation that happened elsewhere onto the lead's thread; the response reports `comments: { added, skipped }` and going over the cap skips rather than fails.\n\nOptional read-only reference data, using the same token: locations, developers, projects and project statuses. Use them to send values that match ours, or to show project content on your own pages. They share the lead endpoint's rate limit, so cache them.\n\nOptional compliance check, using the same token: `POST /public/dncr/check` checks up to 20 UAE mobile numbers against the UAE Do Not Call Registry before you contact them. Answers are cached for 180 days, and `fresh: true` asks the registry again.\n\nAuthentication is OAuth 2.0 Client Credentials; there is no user login. Note that the `/v2` prefix is part of the server URL and is mandatory.\n\nThe intake is deliberately forgiving: name-based lookup fields that cannot be matched do NOT fail the request — the lead is still created and the unmatched values are returned in `intakeUnresolved`.\n\nThe endpoint is not idempotent at the transport level, but intake hygiene runs before the lead is created: a second enquiry from the same phone/email within the merge window (~24h) is MERGED into the existing lead and returns a different, much shorter 201 body — `{ id, merged: true, matchedOn }` — with no contactId, intakeUnresolved, needsIntakeReview or createdAt. Always branch on `merged` before reading anything else. Enquiries from property-portal sources (Property Finder, Bayut, Dubizzle) are exempt and never merge. Retry only on network timeouts, 429 and 5xx.",
     "contact": {
       "name": "Provident API support"
@@ -652,6 +652,9 @@
           },
           "429": {
             "$ref": "#/components/responses/RateLimited"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
           }
         }
       }
@@ -732,6 +735,9 @@
           },
           "429": {
             "$ref": "#/components/responses/RateLimited"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
           }
         }
       }
@@ -787,6 +793,9 @@
           },
           "429": {
             "$ref": "#/components/responses/RateLimited"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
           }
         }
       }
@@ -871,6 +880,9 @@
           },
           "429": {
             "$ref": "#/components/responses/RateLimited"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
           }
         }
       }
@@ -955,6 +967,9 @@
           },
           "429": {
             "$ref": "#/components/responses/RateLimited"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
           }
         }
       }
@@ -1009,6 +1024,9 @@
           },
           "429": {
             "$ref": "#/components/responses/RateLimited"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
           }
         }
       }
@@ -1237,6 +1255,9 @@
           },
           "429": {
             "$ref": "#/components/responses/RateLimited"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
           }
         }
       }
@@ -1361,6 +1382,9 @@
           },
           "429": {
             "$ref": "#/components/responses/RateLimited"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
           }
         }
       }
@@ -1425,6 +1449,9 @@
           },
           "429": {
             "$ref": "#/components/responses/RateLimited"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
           }
         }
       }
@@ -1467,6 +1494,9 @@
           },
           "429": {
             "$ref": "#/components/responses/RateLimited"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
           }
         }
       }
@@ -1565,6 +1595,9 @@
           },
           "429": {
             "$ref": "#/components/responses/RateLimited"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
           }
         }
       },
@@ -1661,6 +1694,9 @@
           },
           "429": {
             "$ref": "#/components/responses/RateLimited"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
           }
         }
       }
@@ -1765,6 +1801,9 @@
           },
           "429": {
             "$ref": "#/components/responses/RateLimited"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
           }
         }
       }
@@ -1852,6 +1891,9 @@
           },
           "429": {
             "$ref": "#/components/responses/RateLimited"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
           }
         }
       }
@@ -2027,6 +2069,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
           }
         }
       }
@@ -2239,6 +2284,26 @@
               ],
               "path": "/v2/public/developers?page=1&limit=2",
               "timestamp": "2026-08-19T07:20:28.507Z"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "Your credentials are not enabled for this endpoint (or your IP is not on the client's allowlist).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            },
+            "example": {
+              "statusCode": 403,
+              "code": "OAUTH_CLIENT_GRANT_MISSING",
+              "message": "This client is not allowed to use this endpoint. It needs the \"client:dncr:check:create\" grant.",
+              "details": {
+                "requiredGrant": "client:dncr:check:create"
+              },
+              "path": "/v2/public/dncr/check",
+              "timestamp": "2026-10-06T12:00:00.000Z"
             }
           }
         }
@@ -2766,6 +2831,15 @@
             ],
             "nullable": true,
             "description": "What became of the `comments[]` you sent; null when you sent none."
+          },
+          "resume": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/LeadResumeResult"
+              }
+            ],
+            "nullable": true,
+            "description": "What became of the `resumeUrl` you sent; null when you sent none."
           }
         },
         "additionalProperties": true
@@ -3133,6 +3207,20 @@
               "$ref": "#/components/schemas/LeadComment"
             },
             "description": "Comments to write onto the lead's thread, OLDEST FIRST — the first entry in the array is the eldest and appears at the bottom of the CRM timeline. Entries sent without a `date`, and entries sharing the same timestamp, keep the order you sent them in. Maximum 5 per request: anything past the fifth is SKIPPED and reported back as `comments.skipped` rather than failing the request, because failing it would throw away a real customer enquiry over a comment. Send a longer conversation as consecutive PUTs, five at a time, oldest batch first. On an update these are ADDED to what the lead already has."
+          },
+          "jobPosition": {
+            "type": "string",
+            "maxLength": 255,
+            "nullable": true,
+            "description": "Recruitment funnel: the job position the applicant applied for, as your form wrote it. Free text — stored as sent, never matched against a list, never reported in `intakeUnresolved`. Send it with `\"funnel\": \"Recruitment\"`. Longer values are cut at 255 characters.",
+            "example": "Property Consultant"
+          },
+          "resumeUrl": {
+            "type": "string",
+            "maxLength": 2048,
+            "nullable": true,
+            "description": "Recruitment funnel: a link to the applicant's CV FILE. We download it shortly after responding and keep our own private copy on the lead; your link need only stay reachable for a few minutes.\n\nMust be a public http(s) URL on the default port, without credentials, returning the file itself: PDF, Word (.doc/.docx), RTF, OpenDocument text, PNG or JPEG, at most 10 MB. The type is read from the file's bytes, not your headers. A link that returns a web page fails; Google Drive `/file/d/<id>/view` and Dropbox `?dl=0` links are converted to direct downloads for you. Up to 5 redirects are followed.\n\nA bad link never fails the request — see `resume` in the response. A new link replaces the lead's CV.",
+            "example": "https://files.example.com/applications/8812/cv.pdf"
           }
         },
         "additionalProperties": true
@@ -3400,6 +3488,15 @@
             ],
             "nullable": true,
             "description": "Any `comments[]` you sent are written to the SURVIVING lead — the conversation belongs on the lead the customer actually has. Null when you sent none."
+          },
+          "resume": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/LeadResumeResult"
+              }
+            ],
+            "nullable": true,
+            "description": "A CV you sent is attached to the surviving lead, replacing any it had; null when you sent none."
           }
         },
         "additionalProperties": false
@@ -4176,6 +4273,20 @@
               "$ref": "#/components/schemas/LeadComment"
             },
             "description": "Comments to write onto the lead's thread, OLDEST FIRST — the first entry in the array is the eldest and appears at the bottom of the CRM timeline. Entries sent without a `date`, and entries sharing the same timestamp, keep the order you sent them in. Maximum 5 per request: anything past the fifth is SKIPPED and reported back as `comments.skipped` rather than failing the request, because failing it would throw away a real customer enquiry over a comment. Send a longer conversation as consecutive PUTs, five at a time, oldest batch first. On an update these are ADDED to what the lead already has."
+          },
+          "jobPosition": {
+            "type": "string",
+            "maxLength": 255,
+            "nullable": true,
+            "description": "Recruitment funnel: the job position the applicant applied for, as your form wrote it. Free text — stored as sent, never matched against a list, never reported in `intakeUnresolved`. Send it with `\"funnel\": \"Recruitment\"`. Longer values are cut at 255 characters. `null` clears it.",
+            "example": "Property Consultant"
+          },
+          "resumeUrl": {
+            "type": "string",
+            "maxLength": 2048,
+            "nullable": true,
+            "description": "Recruitment funnel: a link to the applicant's CV FILE. We download it shortly after responding and keep our own private copy on the lead; your link need only stay reachable for a few minutes.\n\nMust be a public http(s) URL on the default port, without credentials, returning the file itself: PDF, Word (.doc/.docx), RTF, OpenDocument text, PNG or JPEG, at most 10 MB. The type is read from the file's bytes, not your headers. A link that returns a web page fails; Google Drive `/file/d/<id>/view` and Dropbox `?dl=0` links are converted to direct downloads for you. Up to 5 redirects are followed.\n\nA bad link never fails the request — see `resume` in the response. A new link replaces the lead's CV. `null` removes the CV.",
+            "example": "https://files.example.com/applications/8812/cv.pdf"
           }
         },
         "additionalProperties": true
@@ -4238,6 +4349,15 @@
             ],
             "nullable": true,
             "description": "What became of the `comments[]` you sent; null when you sent none."
+          },
+          "resume": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/LeadResumeResult"
+              }
+            ],
+            "nullable": true,
+            "description": "What became of the `resumeUrl` you sent; null when you sent none. `resume` also appears in `updatedFields` whenever you sent one."
           }
         }
       },
@@ -4458,6 +4578,32 @@
                 "description": "Reference for the registry call, when one was made. Quote it when reporting a problem."
               }
             }
+          }
+        }
+      },
+      "LeadResumeResult": {
+        "type": "object",
+        "description": "What became of the `resumeUrl` you sent. `null` when you sent none.",
+        "required": [
+          "status",
+          "error"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "failed",
+              "cleared"
+            ],
+            "description": "`pending` — accepted and being downloaded; nothing more to do. `failed` — unusable on sight, see `error`; send a corrected link with PUT. `cleared` — update only: you sent `null` and the CV was removed. A pending download can still fail later; that is recorded on the lead for the recruiter, not reported to you.",
+            "example": "pending"
+          },
+          "error": {
+            "type": "string",
+            "nullable": true,
+            "description": "Why the link was refused when `status` is `failed`; null otherwise.",
+            "example": null
           }
         }
       }

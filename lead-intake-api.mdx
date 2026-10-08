@@ -15,7 +15,16 @@ description: "The complete integration handbook for POST /v2/public/leads — au
 > 1. New **`POST /v2/public/dncr/check`** (§15). It checks up to 20 UAE mobile numbers against
 >    the Do Not Call Registry before you contact them.
 > 2. Sections 15–17 of the previous revision are now 16–18.
-> 3. Nothing existing changed.
+> 3. New optional **recruitment fields** on `POST` and `PUT`/`PATCH` `/v2/public/leads`
+>    (§4.12): **`jobPosition`** (the role an applicant applied for) and **`resumeUrl`** (a link to
+>    their CV, which we download into our own storage). Responses carry **`resume`** (`null`
+>    when you sent no CV).
+> 4. Nothing existing changed. If you send neither field, every request and response behaves
+>    exactly as before, apart from the extra `resume: null`.
+> 5. **Credentials are now scoped.** Each `client_id` is allowed only the endpoints agreed for
+>    your integration (see *Credentials*). Calling any other endpoint returns
+>    **`403 OAUTH_CLIENT_GRANT_MISSING`** instead of being served. Existing integrations were
+>    given exactly the endpoints they already use, so nothing you call today changes.
 >
 > **Changed 2026-09-19 — read this if you are already integrated.**
 > 1. New **`comments[]`** on both `POST` and `PUT`/`PATCH` `/v2/public/leads` (§4.11) —
@@ -112,6 +121,13 @@ browser would expose your credentials and is blocked by CORS.
 
 If your credentials leak, contact Provident and they will be rotated
 (the old secret stops working immediately).
+
+**Your credentials only open the endpoints agreed for your integration.** A `client_id` that
+was issued to submit leads can submit leads and nothing else; reading lead assignments,
+reference data or running DNCR checks are each enabled separately. Anything outside your
+access answers `403` with `code: "OAUTH_CLIENT_GRANT_MISSING"`, and the response names the
+access it needs in `details.requiredGrant`. If you need another endpoint, ask Provident to
+enable it — retrying will not help.
 
 ---
 
@@ -883,6 +899,67 @@ proper chat view**, chosen because it puts the conversation in front of an agent
 Send `type` and `chatChannel` on every message even though nothing reads them yet — they
 are what will let these be lifted into a real chat later without guesswork.
 
+### 4.12 Job applicants — `jobPosition` and `resumeUrl`
+
+For the **Recruitment** funnel: a job application is posted as a lead like any other enquiry
+(the applicant's phone or email is still required), with `"funnel": "Recruitment"` and two
+extra fields.
+
+| Field | Type | Max | Match | Notes |
+|-------|------|-----|-------|-------|
+| `jobPosition` | `string` | 255 | exact | The role the applicant applied for, as your form wrote it — e.g. `"Property Consultant"`. Free text, never matched against a list, never reported in `intakeUnresolved`. Longer values are cut at 255 characters. |
+| `resumeUrl` | `string` | 2048 | — | A link to the applicant's CV **file**. See below. |
+
+```json
+{
+  "funnel": "Recruitment",
+  "leadFirstName": "Sara",
+  "leadLastName": "Khan",
+  "leadPhones": ["+971501234567"],
+  "leadEmails": ["sara.khan@example.com"],
+  "jobPosition": "Property Consultant",
+  "resumeUrl": "https://files.example.com/applications/8812/cv.pdf"
+}
+```
+
+**How the CV is handled.** We do not keep your link. Shortly *after* responding we download the
+file and store our own private copy on the lead, so your link has to stay reachable for a few
+minutes and never longer. Downloading happens after the response so a slow file host can never
+make your request time out — which matters, because a timed-out request you retry is a
+duplicate application.
+
+**What the link must be.**
+
+- A public `https://` (or `http://`) URL on the default port, with no username or password in
+  it, on a host reachable from the internet.
+- It must return **the file itself**: PDF, Word (`.doc`, `.docx`), RTF, OpenDocument text
+  (`.odt`), PNG or JPEG, **at most 10 MB**. The type is read from the file's own bytes, not from
+  your `Content-Type` header or the file name.
+- A link that returns a **web page** instead fails — a "view" page, a sign-in page, a share page.
+  Two common share links are converted for you: Google Drive `…/file/d/<id>/view` and Dropbox
+  `…?dl=0`. The file must still be shared publicly ("anyone with the link").
+- Up to 5 redirects are followed.
+
+**What you get back.** Every response carries `resume` — `null` when you did not send
+`resumeUrl`, otherwise:
+
+| `resume.status` | Meaning |
+|---|---|
+| `pending` | The link was accepted and is being downloaded. Nothing more to do. |
+| `failed` | The link was unusable on sight; `resume.error` says why. Fix it and send it again with `PUT /v2/public/leads/{id}` (§9). |
+| `cleared` | Only on an update: you sent `"resumeUrl": null` and the CV was removed. |
+
+A `pending` download can still fail afterwards — the host refuses, the file is over 10 MB, it
+turns out to be a web page. That outcome is recorded on the lead for the recruiter and is **not**
+reported back to you, so test your links once by hand.
+
+**Replacing and removing.** Sending a new `resumeUrl` — on a `PUT`, or on a second application
+that is merged into the first (§7) — replaces the lead's CV. On a `PUT`, `"resumeUrl": null`
+removes it and `"jobPosition": null` clears the position. Omitting either field leaves it alone.
+
+**Nothing about the CV can cost you the lead.** A bad link never fails the request: the lead is
+created exactly as it would have been without one.
+
 ---
 
 ## 5. Matching behaviour and `intakeUnresolved`
@@ -1015,6 +1092,7 @@ Both outcomes below return **`201`**. Branch on `merged` before reading anything
 | `agentEnquiryReason` | Why, when `isAgentEnquiry` is `true`: `known_agent`, `prior_lead`, `competitor_domain` or `manual`. `null` otherwise. |
 | `assignedTo` | The agent the lead landed on, or `null`. See the caveat below — `null` here does **not** mean nobody will get it. |
 | `comments` | `{ added, skipped }` when you sent a `comments[]` array (§4.11), `null` when you did not. **`skipped` is customer messages we did not keep** — send them again. |
+| `resume` | `{ status, error }` when you sent `resumeUrl` (§4.12), `null` when you did not. `status` is `pending` or `failed`. |
 | `createdAt` | Creation timestamp (ISO-8601, UTC). |
 
 ```jsonc
@@ -1038,6 +1116,7 @@ Both outcomes below return **`201`**. Branch on `merged` before reading anything
     "active": true
   },
   "comments": { "added": 3, "skipped": 0 },
+  "resume": null,
   "createdAt": "2026-07-27T06:31:04.512Z"
   // … many further fields are present; ignore them
 }
@@ -1104,12 +1183,15 @@ the status is still `201` but the body is **only these few fields**:
     "whatsappPhone": "+971501234567",
     "active": true
   },
-  "comments": { "added": 2, "skipped": 0 }
+  "comments": { "added": 2, "skipped": 0 },
+  "resume": null
 }
 ```
 
 Any `comments[]` you sent are written to the **surviving** lead — the conversation belongs
-on the lead the customer actually has. `comments` is `null` when you sent none.
+on the lead the customer actually has. `comments` is `null` when you sent none. The same goes
+for a `resumeUrl` (§4.12): it is attached to the surviving lead, replacing any CV it had, and
+`resume` reports it exactly as on a new lead.
 
 | Field | Meaning |
 |-------|---------|
@@ -1152,6 +1234,7 @@ Every error uses the same envelope:
 | `401` | `OAUTH_TOKEN_EXPIRED` | Token past `expires_in` | Get a new token, retry once. |
 | `401` | `UNAUTHORIZED` | (Token endpoint) bad client id/secret | Check credentials. Do not retry in a loop. |
 | `403` | `FORBIDDEN` | Your IP is not on the allowlist for this client | Send Provident your egress IPs. |
+| `403` | `OAUTH_CLIENT_GRANT_MISSING` | Your credentials are not enabled for this endpoint; `details.requiredGrant` names the access needed | Ask Provident to enable it. Never retry as-is. |
 | `422` | `VALIDATION_ERROR` | A parameter or field failed validation — including **an unrecognised query parameter**, which is rejected rather than ignored | Fix the request; the `errors` array names the offender. Never retry as-is. Mostly hit on the reference-data endpoints (§14); lead intake itself is deliberately forgiving and does not use this status. |
 | `429` | `RATE_LIMITED` | Daily request quota exceeded | Back off until `Retry-After` seconds, then resume. |
 | `5xx` | `INTERNAL_ERROR` | Server-side failure | Retry with backoff. |
@@ -1290,18 +1373,20 @@ Content-Type: application/json
     "email": "sara.haddad@provident.ae",
     "phone": "+9715xxxxxxx"
   },
-  "comments": { "added": 1, "skipped": 0 }
+  "comments": { "added": 1, "skipped": 0 },
+  "resume": null
 }
 ```
 
 | Field | Meaning |
 |---|---|
 | `updated` | `false` when the submission changed nothing — every value sent was already the lead's. Not an error, and not worth retrying. |
-| `updatedFields` | The lead columns this submission actually changed, by **CRM** name (`closingAreaId` is what `areaOfInterest` fills). `leadPhones` / `leadEmails` appear when a new one was added, `quizAnswers` when answers were written, `metaFacebook` when the Meta block was stored, `comments` when at least one comment was posted. |
+| `updatedFields` | The lead columns this submission actually changed, by **CRM** name (`closingAreaId` is what `areaOfInterest` fills). `leadPhones` / `leadEmails` appear when a new one was added, `quizAnswers` when answers were written, `metaFacebook` when the Meta block was stored, `comments` when at least one comment was posted, `resume` whenever you sent `resumeUrl`. |
 | `intakeUnresolved` | Values sent on **this** submission that matched no CRM record (§5). Merged with whatever was already unresolved on the lead — an update never clears a flag it did not answer. |
 | `rerouted` | `true` when the update sent an ownerless lead back through the assignment engine. |
 | `assignedTo` | The agent holding the lead as the response was written, or `null`. Same shape as §10. |
 | `comments` | `{ added, skipped }` when you sent a `comments[]` array (§4.11), `null` when you did not. |
+| `resume` | `{ status, error }` when you sent `resumeUrl` (§4.12) — `pending`, `failed` or `cleared` — and `null` when you did not. |
 
 ### Errors
 
